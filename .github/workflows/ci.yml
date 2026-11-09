@@ -35,8 +35,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install wasm32-unknown-unknown target
-        run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm32 target and lint components
+        # rust-toolchain.toml 触发的 rustup 自动安装不含 clippy/rustfmt（minimal 面）
+        run: rustup target add wasm32-unknown-unknown && rustup component add clippy rustfmt
 
       # wasm32 走 --no-default-features --features wasm：zstd 档关闭（zstd-sys 含 C 源，
       # 交叉需 clang），仅 lz4 纯 Rust 档，零 C 依赖。getrandom custom 后端 cfg 由
