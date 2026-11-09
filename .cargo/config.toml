@@ -1,0 +1,6 @@
+# wasm32-unknown-unknown：getrandom 无该目标默认后端（js feature 需 wasm-bindgen，
+# 禁引）——走 "custom" 后端，回调由 crate 内
+# flock_protocol::wasm_bridge::__getrandom_v03_custom 提供（getrandom-0.3.4
+# src/backends/custom.rs 契约）。仅对该 target 生效，原生构建不受影响。
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"custom\""]

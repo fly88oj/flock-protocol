@@ -1,0 +1,10 @@
+# Rust 构建产物
+/target
+
+# 库 crate 惯例：不提交 Cargo.lock（仅二进制 crate 提交）。
+# 引用方以语义化版本约束解析，锁文件由各下游自己的 workspace 维护。
+/Cargo.lock
+
+# 本地编辑器/系统杂项
+*.swp
+.DS_Store

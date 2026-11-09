@@ -1,0 +1,271 @@
+//! showroom 跨生态固定向量（M1 完成标准：信封 v1 只读兼容——showroom `seal` 产物被
+//! `open_v1_legacy` 解开且长度不变量断言通过；§1.3.2 兼容面「逐字节不变」实证）。
+//!
+//! 向量来源：**真实 showroom-common 3.0 产物**（E:\Works\showroom 的 showroom-common，
+//! 依赖代际 ed25519-dalek 2.2.0 / rsa 0.9.10 / aes-gcm 0.10.3 / rand 0.8.8），
+//! 于 Linux 容器（rust:1-slim-bookworm）中一次性生成后固化：
+//! - SR-SIG1：确定性 Ed25519（RFC 8032）⇒ 本 crate ed25519-dalek 3.0 下必须逐字节复现；
+//! - v1 信封：showroom `seal`（RSA-3072-OAEP-SHA256 封装 + AES-256-GCM 无 AAD 分段），
+//!   确定性 RSA 私钥（seeded StdRng）⇒ 本 crate `open_v1_legacy`（aes-gcm 0.11 代际）必须解开。
+//!
+//! sig 部分不依赖 feature；envelope 部分需 `legacy`。
+
+// ———— SR-SIG1（showroom ed25519-dalek 2.2 生成 → 本 crate 3.0 复现/互通）————
+
+const SIG_SEED_HEX: &str = "01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3da";
+const SIG_PUB: &str = "ed25519:5AMJmM/VrRcjwWn5VqoLnrhhm1mSvWEsKvQo68efjfA";
+// 被签 body 哈希（showroom 3.0.0 固化，互通向量组成部分）：SR-SIG1 签名/验签走 prehashed，
+// SIG_AUTH 逐字节锚定本哈希；生成侧 body 字面量是 showroom 旧品牌样本，不在本文件内联。
+const SIG_BODY_SHA: &str = "4275bf77e20cdf1f5c8f4707c2adccfd5f4b60b44d3847a2a06210e5e1923c2d";
+const SIG_AUTH: &str = "SR-SIG1 alice:1700000000:cafe0011beef2233:kk4QottRyoNykwtvn0XSn0slqLLfeyx-sa2czyfHxLGy1LZ8TYHFolIy5TveIaDU8nN3-B54vhJRRdvng8NOAQ";
+const SIG_TS: i64 = 1_700_000_000;
+// 哈希一致性自洽样本（flock 品牌，自生成自断言；非互通面——仅验证 sha256_hex 与流式接口一致）。
+const HASH_BODY: &str = "flock-protocol-cross-check";
+const HASH_BODY_SHA: &str = "0a4b3d93b4ee5f9a71fe22b046263282aae9472fa6663d55d56287b90423dc1e";
+
+#[test]
+fn showroom_sig_vector_byte_exact() {
+    use flock_protocol::sig;
+
+    let seed: [u8; 32] = hex::decode(SIG_SEED_HEX).unwrap().try_into().unwrap();
+    let k = sig::UserKey::from_seed(&seed);
+    // 公钥串逐字节一致
+    assert_eq!(k.pub_string(), SIG_PUB);
+    // 签名逐字节复现（确定性 Ed25519：dalek 2.2 与 3.0 输出必须完全相同）
+    let auth = sig::sign_prehashed(
+        "alice",
+        &k,
+        "POST",
+        "/_api/publish?project=demo",
+        SIG_BODY_SHA,
+        SIG_TS,
+        "cafe0011beef2233",
+    );
+    assert_eq!(auth, SIG_AUTH, "SR-SIG1 线上格式跨代际逐字节不变（§1.3.2）");
+    // 哈希与流式哈希一致（自洽样本，非互通面）
+    assert_eq!(sig::sha256_hex(HASH_BODY.as_bytes()), HASH_BODY_SHA);
+    assert_eq!(
+        sig::sha256_hex_stream(std::io::Cursor::new(HASH_BODY.as_bytes())).unwrap(),
+        HASH_BODY_SHA
+    );
+    // showroom 生成的签名在本 crate 验签通过（含 ±300s 窗边界）
+    let vk = [sig::UserKey::from_pub_string(SIG_PUB).unwrap()];
+    let v = sig::verify_with_hash(
+        SIG_AUTH,
+        &vk,
+        "POST",
+        "/_api/publish?project=demo",
+        SIG_BODY_SHA,
+        SIG_TS,
+    )
+    .expect("showroom 签名必须验过");
+    assert_eq!(
+        (v.user.as_str(), v.ts, v.nonce.as_str()),
+        ("alice", SIG_TS, "cafe0011beef2233")
+    );
+    assert!(sig::verify_with_hash(
+        SIG_AUTH,
+        &vk,
+        "POST",
+        "/_api/publish?project=demo",
+        SIG_BODY_SHA,
+        SIG_TS + 300
+    )
+    .is_ok());
+    assert_eq!(
+        sig::verify_with_hash(
+            SIG_AUTH,
+            &vk,
+            "POST",
+            "/_api/publish?project=demo",
+            SIG_BODY_SHA,
+            SIG_TS + 301
+        ),
+        Err(sig::AuthError::Stale)
+    );
+    // 篡改 body 哈希 ⇒ 拒（原 showroom_interop 的独有断言，合并于此）
+    assert_eq!(
+        sig::verify_with_hash(
+            SIG_AUTH,
+            &vk,
+            "POST",
+            "/_api/publish?project=demo",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            SIG_TS
+        ),
+        Err(sig::AuthError::BadSignature)
+    );
+}
+
+// ———— 信封 v1（showroom seal 产物 → 本 crate open_v1_legacy 解开；legacy feature）————
+
+#[cfg(feature = "legacy")]
+mod v1 {
+    use flock_protocol::envelope::{open_v1_legacy, KEY_LEN, NONCE_LEN, SEG, TAG_LEN, WRAP_LEN};
+    use rsa::pkcs8::DecodePrivateKey;
+    use rsa::RsaPrivateKey;
+    use std::io::Cursor;
+
+    /// 确定性 RSA-3072 私钥（生成侧 seeded StdRng；仅测试向量用，非生产材料）。
+    const RSA_PEM: &str = r####"-----BEGIN PRIVATE KEY-----
+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
+ooKPGHxyjAFTeBZV53nIF1E=
+-----END PRIVATE KEY-----
+"####;
+
+    /// showroom seal(1000B 模式明文) 产物（1412B = 384 + 1000 + 1×28，单段）。
+    const SEALED_A_HEX: &str = "622e50f5063f3728df799d3b35bd637d099d940236b61aef3c039cf2493f8841fdfb550f0327d9503040cf1fe914345d026b2a8d5d0718d6bc93955fa41257e0272ab9da0b030d55b4ae59518df5c9e1ff517c5ba73785883e3037eca096096dbe5e8ec94aff9be8f9ac4b67659f5cdf9f4854076b5a831e8719eaf80dbaa37432cd31a5fb3d6d6aaff8dac55182fd9eb117e74df947922b6a2bb6023150e6e6fdb83f7b649999e90278e4de0d8ffcd9bd9ee1d9f4c99913f0b5b699f26d3ef486d29d84372a9cfdf318dbdc516b31352a3402c15bd320fedf18f202155d9440a518b650edc35c06690de8a9f5e0d14b79bd086be882728d190ff23cc6fd8450d9db52c421b8d2db6689e5d23dde80b7ac605eb2eaeb183bc1ace0cafef951be212b5a25e6db5981ea195aca51ae2db0a7ebb240d61425c395f57aa32632fe6c5763bac39ef8d20adc23d010267b9b9bc698ec4ba8ccc1446aa0b0481e839759a79eae3be6e5df6b4e19ce704f789e3fe5000478091de0fbcce3cfc362a61fbcdd26222aa36edf703623d236a335503bc309cb26e9cb72736c511a718c2fe09f7474fef8c63005f3067a2b608715f041c495193ab28ab050c614fd1f17c2916b6715fc3ecbe207f1a4591ec6499e45ba3157feef7491b045420212877bbbbbec43c6a3fa0ceea2a010cca0c0519ed2ef25450cc807013a6edeb2086f9d28f45a48b3904fd9366d5b3fe8a49bfbe4b9429473b776c334b226d9fa799585a81e29069890d2f5594b19b45032454666e34a572e8c77ed104e8dfd26222d3d6bd929861cdb82150bd284ccb02d06a89907bfbed7372b4e1a60a67d4cd01c3dbbe85ad5b201be32f151496b7256ebb836e5e62b267260b71311935d82d59413cbff88c23a802a0bfa3765aafb7ca4efb3fa8aadb7c994fb1b3bf19da69ef1d332ae5a93814d03fa54cc9bffbcf2677560ee30eaaecee05a6a02c9ddbd0ef1de413d9304644d3bcb0f2a81bcc43d002c88dd5b0a35a546376c1d9f64e8ce535b68240775cec0966aa7707b757ed3d06d5d989904dcdc679dd1eec1bcf36eb87328925306a8d4dcd33851dac1856bda14a268c1e5afceb2aa7e302baf80d741682994aa5235458c00ddeb605f3ee08018c41a25ea02fb1daacaa5d9ec9f4a159c6b47b6353579c809e09d9f6e948b4eea40edb7cb7aa3101531a991568912fe1ff4b6c522fc5b484897c25e8da70693c86a342cd862208908745f8b9a67b3cf0ba9bfb0db09129f69c46196bc6b903fa54ba8a0c119a6bc4e0ada484a1eaae531f73f5b87320fbb3f3200302c34ba0cedee9d682e4fbf1f1093f71915bfcc1ba562e28679c752547ef6d649fd565a2e805b46bc6eb5fd442723a4922ba2c5612c7644ae67ded99b9011f60fbfa79b6744b8ca7f10e7b507af604e34113760154d6bf6af806f428c8d68d327f50e2f0dd0358364c9842bb2142f9b2683940531e94bd7bb29f1870f07e833ca91e99a66ac8acd0dbfa7cbd82d3234d77a3ad04b62350a55af29ddda6e8808a812bc631cd530ff6ef602dcbdf446aea5eba808c04c754929a6680d040f889b45f9ae89ee20859befe7067ad9e1da6f2688abdbfad55e36f42e7ce22ca8354f4c56c432a4ecad424246bbeac6819c654b8b795ff99e83e34cd4bb5a1a20cd1bf292abd000210a2ada49ce65b64dcd14bcb6231dacc90e15d0db4ea53ec348f5f607dc3becf4709573090215cfe386af70f126dc7237c8b81e32c2e02cc9c3831ed0b45894b911cf09a42481ed851b939b990f1784759115cffa02fb961df2076d47695a7d3d179b57184a71ea4905c7b26f31124b106c8d43c108ba90e487c92a28d49f95179f78d47de46d1a78080e330ccb8234a95b3593c3d0abbb0244d9f68caeb4da39adb8e970b4a7c475f43e80cc2ad25cf5cf679179d7eb52da0f2595fb9e43de13eecdcc3a564e6f73eea8f2c30f53d2f75c75e802f84134";
+    /// showroom seal(空输入) 产物（仅 384B 头，合法空信封）。
+    const SEALED_B_HEX: &str = "13c38500d321050103e54effd9ecbb1337d51bf0d513a207526fa9ea2899c93b8af35a5d4e3af37d5e12f4816600bc9a7b4e39e1d3f28dd1d945282401d962d3f4b97aef0c3462558194c9149fb27dec162a68257d774f65ce8fa0fe3eac6f858fe4dc2889661b593e8d254f972a0e513c1dfbd06a63011e77a1fa714bdf842fcd6e4f33c6603d8d363017977fa52f3bf673fe446bc90085962d68297bbdb339412ff67a191dfc1b0b2c1e118e3a4545631e8747bfaebc4eff46e831ed56e7ee052dd8e2e22546d2a0daa3601b98091d978a742d22d4388b2cb7490830bea8a4f3377f27c09910ddd4180831687f3dd581d7d6a124c0bfa199c0ff3bab5d8f28174cc02a7809ab7a726fab2898c349823c967b8189779a80ce416deee930d21103a76f80ff88f8dcd50d7578850776799ab037bf7896c071b06e24688cb49ea49c133e34a7158a7b13315e098c44594c6d32a9a54cceb0d34cb6fec5c9122597b7929950551f5a2b13ffd021f9d94224ae3e81af47d85e18292e6b95e3e006fa";
+
+    fn priv_key() -> RsaPrivateKey {
+        RsaPrivateKey::from_pkcs8_pem(RSA_PEM).expect("fixture pem")
+    }
+
+    fn plain_a() -> Vec<u8> {
+        (0..1000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn showroom_seal_opened_by_v1_legacy() {
+        let sk = priv_key();
+        let sealed = hex::decode(SEALED_A_HEX).unwrap();
+        // 长度不变量（P0-1 兼容档守门）：384 + n + ceil(n/4MiB)×(12+16)
+        let n = 1000usize;
+        assert_eq!(
+            sealed.len(),
+            WRAP_LEN + n + n.div_ceil(SEG) * (NONCE_LEN + TAG_LEN)
+        );
+        assert_eq!(sealed.len(), 1412);
+        let mut out = Vec::new();
+        let m = open_v1_legacy(&sk, Cursor::new(sealed.as_slice()), &mut out)
+            .expect("showroom seal 产物必须被解开");
+        assert_eq!(m as usize, n);
+        assert_eq!(out, plain_a());
+    }
+
+    #[test]
+    fn showroom_empty_envelope_opened() {
+        let sk = priv_key();
+        let sealed = hex::decode(SEALED_B_HEX).unwrap();
+        assert_eq!(sealed.len(), WRAP_LEN);
+        let mut out = Vec::new();
+        let m = open_v1_legacy(&sk, Cursor::new(sealed.as_slice()), &mut out).expect("空信封合法");
+        assert_eq!(m, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn showroom_fixture_tamper_rejected() {
+        let sk = priv_key();
+        let mut sealed = hex::decode(SEALED_A_HEX).unwrap();
+        sealed[WRAP_LEN + NONCE_LEN + 5] ^= 1; // 段密文区
+        let mut out = Vec::new();
+        assert!(open_v1_legacy(&sk, Cursor::new(sealed.as_slice()), &mut out).is_err());
+        let mut sealed2 = hex::decode(SEALED_A_HEX).unwrap();
+        sealed2[10] ^= 1; // RSA 封装头区
+        assert!(open_v1_legacy(&sk, Cursor::new(sealed2.as_slice()), &mut out).is_err());
+        // 长度自检：KEY_LEN 常量与 v1 语义一致
+        assert_eq!(KEY_LEN, 32);
+    }
+    // ———— v1 多段长度不变量（镜像 sealer：RSA-OAEP-SHA256 + AES-GCM 无 AAD，
+    //     布局与 showroom-common seal 逐字节同构；单段互通已由上面的真实产物向量守门）————
+
+    /// 测试专用 v1 封装镜像（showroom-common lib.rs:378-412 同构；仅测试内使用）。
+    fn seal_v1_mirror(pub_key: &rsa::RsaPublicKey, plain: &[u8]) -> Vec<u8> {
+        use aes_gcm::aead::inout::InOutBuf;
+        use aes_gcm::aead::{AeadInOut, KeyInit};
+        use aes_gcm::Aes256Gcm;
+        use rsa::sha2::Sha256;
+
+        let mut os = rsa::rand_core::OsRng;
+        let mut k = [0u8; 32];
+        use rsa::rand_core::RngCore as _;
+        os.fill_bytes(&mut k);
+        let wrapped = pub_key
+            .encrypt(&mut os, rsa::Oaep::new::<Sha256>(), &k)
+            .expect("oaep wrap");
+        assert_eq!(wrapped.len(), WRAP_LEN);
+        let mut out = wrapped;
+        let cipher = Aes256Gcm::new(&aes_gcm::Key::<Aes256Gcm>::try_from(&k[..]).expect("32B key"));
+        for chunk in plain.chunks(SEG) {
+            if chunk.is_empty() {
+                break; // 空输入仅头
+            }
+            let mut nonce = [0u8; 12];
+            os.fill_bytes(&mut nonce);
+            let mut buf = chunk.to_vec();
+            let tag = cipher
+                .encrypt_inout_detached(
+                    &aes_gcm::Nonce::<<Aes256Gcm as aes_gcm::aead::AeadCore>::NonceSize>::from(
+                        nonce,
+                    ),
+                    b"",
+                    InOutBuf::from(&mut buf[..]),
+                )
+                .expect("enc");
+            out.extend_from_slice(&nonce);
+            out.extend_from_slice(&buf);
+            out.extend_from_slice(tag.as_slice());
+        }
+        out
+    }
+
+    #[test]
+    fn v1_mirror_multi_segment_invariant() {
+        let sk = priv_key();
+        let pub_key = rsa::RsaPublicKey::from(&sk);
+        for len in [0usize, SEG, SEG * 2 + 1234] {
+            let plain: Vec<u8> = (0..len as u32).map(|i| (i % 251) as u8).collect();
+            let sealed = seal_v1_mirror(&pub_key, &plain);
+            let segs = len.div_ceil(SEG);
+            // v1 长度不变量：384 + n + ceil(n/4MiB)×(12+16)
+            assert_eq!(
+                sealed.len(),
+                WRAP_LEN + len + segs * (NONCE_LEN + TAG_LEN),
+                "len={len}"
+            );
+            let mut out = Vec::new();
+            let m = open_v1_legacy(&sk, Cursor::new(sealed.as_slice()), &mut out)
+                .unwrap_or_else(|e| panic!("len={len}: {e}"));
+            assert_eq!(m as usize, len);
+            assert_eq!(out, plain);
+        }
+    }
+}
