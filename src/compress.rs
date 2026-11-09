@@ -1,46 +1,64 @@
-//! 压缩档位与帧格式（§1.3.3e / §3.7，P0-4、P1-7）。
+//! Compression levels and frame format (§1.3.3e / §3.7, P0-4, P1-7).
 //!
-//! - **默认关闭**（`Mode::Off`）；按策略/按流开启——VORACLE/CRIME/BREACH 前提在 flock 主仓
-//!   成立（FRP 中转即长度观察点，compression-2026 §3.2），开启时配输出填充。
-//! - 档位（compression-2026 §0/§2 实测映射）：`<128B` 直通（40B 反膨胀 122.5%、120B 零收益）；
-//!   Interactive/Bulk = zstd-1（帧级同 codec；Bulk 的分块/上下文复用属流式层，后续批次）；
-//!   Archive = zstd-19 仅归档档；[`Algorithm::Lz4`]（lz4_flex 0.14）作 CPU 受限备选。
-//! - **非膨胀回退 MUST**（RFC 3173 §2.2）：试压不缩小即发明文；「连续失败自适应停试」
-//!   是有状态策略，属流式层（本帧 API 无状态，如实声明）。
-//! - 先压后密顺序不变（RFC 3173 §1）；压缩发生在记录层 payload 内（调用方：先
-//!   `compress_frame` 再进 AEAD）。
-//! - 填充联动：`PadPolicy::Multiple16` 把帧总长补到 16B 倍数（起步值；可调桶化属上层策略）。
-//! - dictID 协商**占位**：帧头留 `dict_id` 槽位（0=无字典）；字典训练/分发/dictID 进握手
-//!   扩展属握手层（§3.7 接缝），本批次不接内容。
+//! - **Off by default** (`Mode::Off`); enabled per-policy/per-stream — the
+//!   VORACLE/CRIME/BREACH preconditions do hold in the flock main
+//!   repository (the FRP relay is a length observation point,
+//!   compression-2026 §3.2), so output padding accompanies it when
+//!   enabled.
+//! - Levels (compression-2026 §0/§2 measured mapping): `<128B` passes
+//!   through (40B inflation 122.5%, 120B zero gain); Interactive/Bulk =
+//!   zstd-1 (same codec at frame level; Bulk's chunking/context reuse
+//!   belongs to the streaming layer, later batch); Archive = zstd-19,
+//!   archive tier only; [`Algorithm::Lz4`] (lz4_flex 0.14) as the
+//!   CPU-constrained fallback.
+//! - **Non-expanding fallback is a MUST** (RFC 3173 §2.2): if a trial
+//!   compression does not shrink, emit plaintext; "adaptive stop after
+//!   consecutive failures" is stateful policy belonging to the streaming
+//!   layer (this frame API is stateless and says so honestly).
+//! - Compress-then-encrypt order unchanged (RFC 3173 §1); compression
+//!   happens inside the record-layer payload (caller: `compress_frame`
+//!   first, then into AEAD).
+//! - Padding interplay: `PadPolicy::Multiple16` pads the total frame
+//!   length to a multiple of 16B (starting value; tunable bucketing is
+//!   upper-layer policy).
+//! - dictID negotiation is a **placeholder**: the frame header reserves a
+//!   `dict_id` slot (0 = no dictionary); dictionary training/distribution/
+//!   dictID in a handshake extension belong to the handshake layer (§3.7
+//!   seam) and are not wired in this batch.
 //!
-//! 帧格式（13B 头）：
+//! Frame format (13B header):
 //!
 //! ```text
 //! [1B flags][4B dict_id LE][4B orig_len LE][4B payload_len LE][payload …len][pad 0x00…]
-//! flags: bit0 = 已压缩；bits1..=2 = 算法（0=zstd, 1=lz4）；bits3..=7 = 保留 0
-//! pad  : 帧尾 0x00 填充（payload_len 之外的尾字节必须全 0，读者按此校验）
+//! flags: bit0 = compressed; bits1..=2 = algorithm (0=zstd, 1=lz4); bits3..=7 = reserved 0
+//! pad  : 0x00 padding at frame end (all bytes beyond payload_len must be zero; readers validate this)
 //! ```
 
 use core::fmt;
 
-/// 直通阈值：明文 < 128B 不试压（compression-2026 §0 实测反膨胀/零收益）。
+/// Passthrough threshold: plaintext < 128B is not trial-compressed
+/// (compression-2026 §0 measured inflation/zero gain).
 pub const PASSTHROUGH_MIN: usize = 128;
-/// 帧头长度。
+/// Frame header length.
 pub const FRAME_HEADER_LEN: usize = 13;
 
-/// 帧错误：格式非法 / 尾填充非零 / 解压失败（含长度不符）/ 输入超限 / 裁剪构建缺能力。
+/// Frame error: malformed format / non-zero trailing padding /
+/// decompression failure (including length mismatch) / oversized input /
+/// trimmed build missing a capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompressError {
-    /// 帧头截断/长度越界/保留位非零。
+    /// Truncated header / out-of-range lengths / non-zero reserved bits.
     MalformedFrame(&'static str),
-    /// 尾部填充字节非零（帧被篡改或拼接）。
+    /// Non-zero trailing padding bytes (frame tampered or spliced).
     BadPadding,
-    /// 解压失败或 orig_len 不符。
+    /// Decompression failure or orig_len mismatch.
     DecompressFailed,
-    /// 输入超过可表示上限（orig_len/payload_len 为 u32；plain > u32::MAX 拒绝
-    /// 而非静默截断长度域）。
+    /// Input exceeds the representable cap (orig_len/payload_len are u32;
+    /// plain > u32::MAX is rejected rather than silently truncating the
+    /// length field).
     InputTooLarge,
-    /// 裁剪构建缺所需能力（如关闭 `zstd` feature 后解到算法 id 0 的 zstd 帧）。
+    /// Trimmed build missing the required capability (e.g. decoding an
+    /// algorithm id 0 zstd frame with the `zstd` feature disabled).
     MissingFeature(&'static str),
 }
 
@@ -60,59 +78,73 @@ impl fmt::Display for CompressError {
 
 impl std::error::Error for CompressError {}
 
-/// 压缩档位（§1.3.3e）。
+/// Compression level (§1.3.3e).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// 默认：不压不填，恒直通。
+    /// Default: no compression, no padding, always passthrough.
     #[default]
     Off,
-    /// 交互流：zstd-1（低延迟；小报文字典档位属握手层占位）。
+    /// Interactive streams: zstd-1 (low latency; the small-packet
+    /// dictionary tier is a handshake-layer placeholder).
     Interactive,
-    /// 批量流：zstd-1（帧级同 Interactive；分块 16–64KB/flush/上下文复用属流式层）。
+    /// Bulk streams: zstd-1 (same as Interactive at frame level; 16–64KB
+    /// chunking/flush/context reuse belong to the streaming layer).
     Bulk,
-    /// 归档档：zstd-19（仅离线归档；CPU/时延最高）。
+    /// Archive tier: zstd-19 (offline archival only; highest CPU/latency).
     Archive,
 }
 
-/// 输出填充（长度观察点缓解；与压缩档联动开启）。
+/// Output padding (length-observation-point mitigation; enabled alongside
+/// compression levels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PadPolicy {
-    /// 不填充（默认；Off 档恒不填）。
+    /// No padding (default; the Off level never pads).
     #[default]
     Off,
-    /// 帧总长补齐 16B 倍数（起步值；桶化可调属上层）。
+    /// Pad the total frame length to a multiple of 16B (starting value;
+    /// tunable bucketing belongs to upper layers).
     Multiple16,
 }
 
-/// 压缩算法（lz4_flex 0.14 = CPU 受限端备选，compression-2026 §0）。
+/// Compression algorithm (lz4_flex 0.14 = CPU-constrained fallback,
+/// compression-2026 §0).
 ///
-/// `zstd` feature（默认开）关闭时 [`Algorithm::Zstd`] 不存在、默认档为 [`Algorithm::Lz4`]，
-/// 且 [`decompress_frame`] 遇算法 id 0（zstd）的帧返回 [`CompressError::MissingFeature`]——
-/// 用于无 C 工具链目标（wasm32 交叉需 clang 编 zstd-sys）的裁剪构建。
+/// With the `zstd` feature (on by default) disabled,
+/// [`Algorithm::Zstd`] does not exist, the default algorithm becomes
+/// [`Algorithm::Lz4`], and [`decompress_frame`] returns
+/// [`CompressError::MissingFeature`] for frames with algorithm id 0 (zstd)
+/// — for trimmed builds on targets without a C toolchain (wasm32 cross
+/// needs clang to build zstd-sys).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Algorithm {
-    /// zstd（默认档；`zstd` feature 专属）。
+    /// zstd (default tier; requires the `zstd` feature).
     #[cfg(feature = "zstd")]
     #[default]
     Zstd,
-    /// lz4 块压缩（无 zstd 硬件加速/CPU 受限场景；无 `zstd` feature 时的默认档）。
+    /// lz4 block compression (no zstd hardware acceleration / CPU
+    /// constrained; the default tier when the `zstd` feature is absent).
     #[cfg(not(feature = "zstd"))]
     #[default]
     Lz4,
-    /// lz4 块压缩（`zstd` feature 开启时的备选档）。
+    /// lz4 block compression (the fallback tier when the `zstd` feature is
+    /// enabled).
     #[cfg(feature = "zstd")]
     Lz4,
 }
 
-/// 字典引用（**dictID 协商占位**）：`dict_id` 进帧头槽位供握手层比对版本一致性；
-/// 字典内容训练与分发属握手层（§3.7 接缝），本批次不接压缩路径。
+/// Dictionary reference (**dictID negotiation placeholder**): `dict_id`
+/// goes into the frame header slot for the handshake layer to compare
+/// version consistency; dictionary content training and distribution
+/// belong to the handshake layer (§3.7 seam) and are not wired into the
+/// compression path in this batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DictRef {
-    /// 0 = 无字典；非 0 = 握手层协商的字典版本 id（仅透传比对）。
+    /// 0 = no dictionary; non-zero = dictionary version id negotiated by
+    /// the handshake layer (passed through for comparison only).
     pub dict_id: u32,
 }
 
-/// 压缩策略（§1.3.3e 结构 + 填充联动字段）。
+/// Compression policy (§1.3.3e structure + padding interplay fields).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CompressPolicy {
     pub mode: Mode,
@@ -122,7 +154,7 @@ pub struct CompressPolicy {
 }
 
 impl CompressPolicy {
-    /// 全直通策略（`Mode::Off`）。
+    /// All-passthrough policy (`Mode::Off`).
     pub fn off() -> Self {
         Self::default()
     }
@@ -146,12 +178,15 @@ fn flags(compressed: bool, alg: Algorithm) -> u8 {
     c | (a << 1)
 }
 
-/// 压缩一帧：按策略试压，**试压不缩即发明文**（RFC 3173 §2.2 非膨胀回退 MUST），
-/// `Mode::Off` 或明文 < [`PASSTHROUGH_MIN`] 恒直通；填充按 [`PadPolicy`] 追加 0x00。
+/// Compress one frame: trial-compress per policy; **if the trial does not
+/// shrink, emit plaintext** (RFC 3173 §2.2 non-expanding fallback MUST).
+/// `Mode::Off` or plaintext < [`PASSTHROUGH_MIN`] always passes through;
+/// padding appends 0x00 per [`PadPolicy`].
 ///
-/// 返回完整帧字节（含 13B 头）。同输入同策略输出确定（无随机性）。
-/// `plain.len() > u32::MAX` ⇒ [`CompressError::InputTooLarge`]（长度域 u32，
-/// 显式报错而非静默截断）。
+/// Returns the complete frame bytes (including the 13B header). Same input
+/// plus same policy gives deterministic output (no randomness).
+/// `plain.len() > u32::MAX` ⇒ [`CompressError::InputTooLarge`] (length
+/// field is u32 — explicit error rather than silent truncation).
 pub fn compress_frame(policy: &CompressPolicy, plain: &[u8]) -> Result<Vec<u8>, CompressError> {
     if plain.len() > u32::MAX as usize {
         return Err(CompressError::InputTooLarge);
@@ -167,14 +202,16 @@ pub fn compress_frame(policy: &CompressPolicy, plain: &[u8]) -> Result<Vec<u8>, 
         let candidate = match policy.alg {
             #[cfg(feature = "zstd")]
             Algorithm::Zstd => zstd::bulk::compress(plain, zstd_level(policy.mode))
-                .expect("zstd compress: 输入长度上限内恒成功"),
+                .expect("zstd compress: always succeeds within the input length cap"),
             Algorithm::Lz4 => lz4_flex::block::compress(plain),
         };
         if candidate.len() < plain.len() {
             payload = candidate;
             compressed = true;
         } else {
-            // 非膨胀回退：试压未缩小 ⇒ 明文（flags 记 0，解压侧直取）
+            // Non-expanding fallback: trial compression did not shrink ⇒
+            // plaintext (flags records 0; the decompress side takes it
+            // directly)
             payload = plain.to_vec();
             compressed = false;
         }
@@ -187,7 +224,8 @@ pub fn compress_frame(policy: &CompressPolicy, plain: &[u8]) -> Result<Vec<u8>, 
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(&payload);
 
-    // 填充联动：Off 模式不填；开启压缩的档位按 16B 倍数补齐帧总长
+    // Padding interplay: Off mode never pads; levels with compression
+    // enabled pad the total frame length to a multiple of 16B
     if policy.mode != Mode::Off && policy.padding == PadPolicy::Multiple16 {
         while frame.len() % 16 != 0 {
             frame.push(0);
@@ -196,10 +234,13 @@ pub fn compress_frame(policy: &CompressPolicy, plain: &[u8]) -> Result<Vec<u8>, 
     Ok(frame)
 }
 
-/// 解压一帧（[`compress_frame`] 逆）。校验：头长度/保留位、orig_len ≤ 会话帧上限
-/// （[`crate::session::MAX_FRAME`]——13B 头可声明 4GiB，防解压侧被诱导巨额分配）、
-/// payload 边界、尾填充全零、解压产物长度 == orig_len。任何不符返回
-/// [`CompressError`]（不 panic）。
+/// Decompress one frame (inverse of [`compress_frame`]). Validates: header
+/// lengths/reserved bits, orig_len ≤ session frame cap
+/// ([`crate::session::MAX_FRAME`] — the 13B header could declare 4GiB;
+/// this prevents the decompress side from being lured into huge
+/// allocations), payload bounds, all-zero trailing padding, decompressed
+/// output length == orig_len. Any mismatch returns [`CompressError`] (no
+/// panic).
 pub fn decompress_frame(frame: &[u8]) -> Result<Vec<u8>, CompressError> {
     if frame.len() < FRAME_HEADER_LEN {
         return Err(CompressError::MalformedFrame("truncated header"));
@@ -215,7 +256,9 @@ pub fn decompress_frame(frame: &[u8]) -> Result<Vec<u8>, CompressError> {
     }
     #[cfg(not(feature = "zstd"))]
     if alg_id == 0 {
-        // 线上格式位保留（0=zstd）；裁剪构建无 zstd 时显式报缺，不误报格式错。
+        // The wire-format slot is reserved (0=zstd); a trimmed build
+        // without zstd reports the missing capability explicitly instead of
+        // misreporting a format error.
         return Err(CompressError::MissingFeature(
             "algorithm zstd requires the `zstd` feature (this is a trimmed build)",
         ));
@@ -224,9 +267,11 @@ pub fn decompress_frame(frame: &[u8]) -> Result<Vec<u8>, CompressError> {
     let alg = alg_id;
     let _dict_id = u32::from_le_bytes(frame[1..5].try_into().expect("13B header"));
     let orig_len = u32::from_le_bytes(frame[5..9].try_into().expect("13B header")) as usize;
-    // 未认证帧头可声明 4GiB orig_len ⇒ zstd/lz4 的容量参数按它预分配。压缩帧是
-    // 记录层 payload（§1.3.3c 单条记录 ≤ 1MiB）⇒ 合法 orig_len 必然 ≤ MAX_FRAME，
-    // 超限在分配前拒绝。
+    // An unauthenticated frame header can declare a 4GiB orig_len ⇒
+    // zstd/lz4 capacity parameters pre-allocate based on it. Compressed
+    // frames are record-layer payloads (§1.3.3c single record ≤ 1MiB) ⇒ a
+    // legitimate orig_len is necessarily ≤ MAX_FRAME; reject over-cap
+    // values before allocating.
     if orig_len > crate::session::MAX_FRAME {
         return Err(CompressError::MalformedFrame(
             "declared orig_len exceeds 1MiB session frame cap",
@@ -239,7 +284,7 @@ pub fn decompress_frame(frame: &[u8]) -> Result<Vec<u8>, CompressError> {
     if frame.len() < payload_end {
         return Err(CompressError::MalformedFrame("payload truncated"));
     }
-    // 尾填充必须全零（payload 之外的所有字节）
+    // Trailing padding must be all zero (every byte beyond the payload)
     if frame[payload_end..].iter().any(|&b| b != 0) {
         return Err(CompressError::BadPadding);
     }
@@ -252,7 +297,7 @@ pub fn decompress_frame(frame: &[u8]) -> Result<Vec<u8>, CompressError> {
                 .map_err(|_| CompressError::DecompressFailed)?,
             1 => lz4_flex::block::decompress(payload, orig_len)
                 .map_err(|_| CompressError::DecompressFailed)?,
-            _ => unreachable!("alg id 已在上文验证 ≤1"),
+            _ => unreachable!("alg id was already validated ≤1 above"),
         }
     } else {
         payload.to_vec()
@@ -268,7 +313,8 @@ mod tests {
     use super::*;
 
     fn lorem(n: usize) -> Vec<u8> {
-        // 可压缩模式文本（重复句子），模拟真实负载
+        // Compressible pattern text (repeated sentence), simulating real
+        // payloads
         let sentence = b"the quick brown fox jumps over the lazy dog; ";
         (0..n).map(|i| sentence[i % sentence.len()]).collect()
     }
@@ -280,7 +326,9 @@ mod tests {
         }
     }
 
-    /// 参与循环的算法集（`zstd` feature 关闭时仅 lz4——裁剪构建仍全量跑 lz4 路径）。
+    /// Algorithm set participating in loops (with the `zstd` feature
+    /// disabled, lz4 only — the trimmed build still exercises the lz4 path
+    /// fully).
     fn algs() -> Vec<Algorithm> {
         #[cfg(feature = "zstd")]
         return vec![Algorithm::Zstd, Algorithm::Lz4];
@@ -288,24 +336,30 @@ mod tests {
         return vec![Algorithm::Lz4];
     }
 
-    // M1 守门：<128B 直通
+    // M1 gate: <128B passthrough
     #[test]
     fn small_input_passthrough() {
         for mode in [Mode::Interactive, Mode::Bulk, Mode::Archive] {
             for len in [0usize, 1, 40, 127] {
                 let plain = lorem(len);
                 let frame = compress_frame(&policy(mode), &plain).unwrap();
-                assert_eq!(frame[0] & 1, 0, "mode={mode:?} len={len}: <128B 必须直通");
+                assert_eq!(
+                    frame[0] & 1,
+                    0,
+                    "mode={mode:?} len={len}: <128B must pass through"
+                );
                 let out = decompress_frame(&frame).unwrap();
                 assert_eq!(out, plain);
             }
         }
     }
 
-    // M1 守门：试压不缩回退明文（incompressible 输入）
+    // M1 gate: trial compression without shrink falls back to plaintext
+    // (incompressible input)
     #[test]
     fn incompressible_falls_back_to_plaintext() {
-        // 伪随机字节（确定性 LCG）：zstd/lz4 都压不动
+        // Pseudo-random bytes (deterministic LCG): neither zstd nor lz4 can
+        // compress them
         let mut x = 0x12345678u32;
         let plain: Vec<u8> = (0..64 * 1024)
             .map(|_| {
@@ -320,12 +374,16 @@ mod tests {
                 ..CompressPolicy::default()
             };
             let frame = compress_frame(&p, &plain).unwrap();
-            assert_eq!(frame[0] & 1, 0, "alg={alg:?}: 试压不缩必须回退明文");
+            assert_eq!(
+                frame[0] & 1,
+                0,
+                "alg={alg:?}: an unshrunk trial must fall back to plaintext"
+            );
             assert_eq!(decompress_frame(&frame).unwrap(), plain);
         }
     }
 
-    // 可压缩输入：各档往返 + 压缩标志
+    // Compressible input: round-trip per level + compression flag
     #[test]
     fn compress_roundtrip_all_modes() {
         let plain = lorem(64 * 1024);
@@ -340,23 +398,24 @@ mod tests {
                 assert_eq!(
                     frame[0] & 1,
                     1,
-                    "mode={mode:?} alg={alg:?}: 可压缩输入应压缩"
+                    "mode={mode:?} alg={alg:?}: compressible input should compress"
                 );
                 assert!(
                     frame.len() < plain.len() + FRAME_HEADER_LEN,
-                    "压缩后应小于明文+头"
+                    "compressed frame should be smaller than plaintext + header"
                 );
                 let out = decompress_frame(&frame).unwrap();
                 assert_eq!(out, plain);
             }
         }
-        // Archive(19) 压得比 Interactive(1) 更小或相等（同 zstd codec 单调性抽查）
+        // Archive(19) compresses to <= Interactive(1) (monotonicity spot
+        // check on the same zstd codec)
         let f_i = compress_frame(&policy(Mode::Interactive), &plain).unwrap();
         let f_a = compress_frame(&policy(Mode::Archive), &plain).unwrap();
         assert!(f_a.len() <= f_i.len());
     }
 
-    // Off 档：恒直通、不填充
+    // Off level: never compresses, never pads
     #[test]
     fn off_mode_never_compresses_or_pads() {
         let plain = lorem(4096);
@@ -372,16 +431,20 @@ mod tests {
         assert_eq!(
             frame[0],
             flags(false, Algorithm::default()),
-            "Off 档不压缩（算法位随默认档）"
+            "Off level does not compress (algorithm bits follow the default tier)"
         );
-        assert_eq!(frame.len(), FRAME_HEADER_LEN + plain.len(), "Off 档不填充");
+        assert_eq!(
+            frame.len(),
+            FRAME_HEADER_LEN + plain.len(),
+            "Off level does not pad"
+        );
         assert_eq!(decompress_frame(&frame).unwrap(), plain);
     }
 
-    // 填充联动：16B 倍数 + 尾零校验
+    // Padding interplay: multiple of 16B + trailing-zero validation
     #[test]
     fn padding_to_multiple_of_16() {
-        let plain = lorem(300); // 300B 可压缩（重复模式）
+        let plain = lorem(300); // 300B compressible (repeated pattern)
         for mode in [Mode::Interactive, Mode::Bulk, Mode::Archive] {
             let p = CompressPolicy {
                 mode,
@@ -389,10 +452,14 @@ mod tests {
                 ..CompressPolicy::default()
             };
             let frame = compress_frame(&p, &plain).unwrap();
-            assert_eq!(frame.len() % 16, 0, "mode={mode:?}: 帧总长 16B 倍数");
+            assert_eq!(
+                frame.len() % 16,
+                0,
+                "mode={mode:?}: total frame length is a multiple of 16B"
+            );
             assert_eq!(decompress_frame(&frame).unwrap(), plain);
         }
-        // 填充 + 直通回退路径（小输入 + 填充开启）
+        // Padding + passthrough fallback path (small input + padding on)
         let small = lorem(50);
         let p = CompressPolicy {
             mode: Mode::Interactive,
@@ -404,7 +471,8 @@ mod tests {
         assert_eq!(decompress_frame(&frame).unwrap(), small);
     }
 
-    // dictID 占位：进帧头、往返保留
+    // dictID placeholder: goes into the frame header, preserved on
+    // round-trip
     #[test]
     fn dict_id_placeholder_passes_through() {
         let plain = lorem(1024);
@@ -419,12 +487,12 @@ mod tests {
         assert_eq!(
             &frame[1..5],
             &0xDEADBEEF_u32.to_le_bytes(),
-            "dictID 槽位透传（协商占位）"
+            "dictID slot passes through (negotiation placeholder)"
         );
         assert_eq!(decompress_frame(&frame).unwrap(), plain);
     }
 
-    // 负向量：篡改头/填充/载荷必须报错
+    // Negative vectors: tampered header/padding/payload must error
     #[test]
     fn malformed_frames_rejected() {
         let plain = lorem(2048);
@@ -436,14 +504,18 @@ mod tests {
         );
 
         let mut t = frame.clone();
-        t[0] |= 0x08; // 保留位
+        t[0] |= 0x08; // reserved bit
         assert_eq!(
             decompress_frame(&t),
             Err(CompressError::MalformedFrame("reserved flag bits set"))
         );
 
-        // 载荷翻转：zstd 帧有 xxhash 校验必拒（lz4 块压缩无内建校验，完整性由外层信封/
-        // SR-SIG1 承担——算法能力差异，非缺陷掩盖）；裁剪构建的等价负向量见下方 orig_len 篡改
+        // Payload flip: the zstd frame carries an xxhash checksum and must
+        // reject (lz4 block compression has no built-in checksum;
+        // integrity is carried by the outer envelope/SR-SIG1 — an
+        // algorithm capability difference, not a defect being concealed);
+        // the equivalent negative vector for trimmed builds is the
+        // orig_len tampering below
         #[cfg(feature = "zstd")]
         {
             let mut t2 = frame.clone();
@@ -454,7 +526,9 @@ mod tests {
                 Err(CompressError::DecompressFailed)
             ));
         }
-        // orig_len 篡改（任何算法/裁剪形态都稳定失败：解压产物长度不符帧头声明）
+        // orig_len tampering (fails consistently across
+        // algorithms/trimmed shapes: decompressed length mismatches the
+        // header declaration)
         let mut t2b = frame.clone();
         let orig = u32::from_le_bytes(t2b[5..9].try_into().unwrap());
         t2b[5..9].copy_from_slice(&(orig + 1).to_le_bytes());
@@ -463,7 +537,7 @@ mod tests {
             Err(CompressError::DecompressFailed)
         ));
 
-        // 填充区写非零
+        // Non-zero byte written into the padding area
         let p = CompressPolicy {
             mode: Mode::Interactive,
             padding: PadPolicy::Multiple16,
@@ -475,7 +549,7 @@ mod tests {
         t3[last3] = 0x01;
         assert_eq!(decompress_frame(&t3), Err(CompressError::BadPadding));
 
-        // orig_len 篡改（直通帧）
+        // orig_len tampering (passthrough frame)
         let mut t4 = compress_frame(&CompressPolicy::default(), b"plain-frame-bytes!").unwrap();
         t4[5] ^= 0x01;
         assert!(matches!(
@@ -484,7 +558,7 @@ mod tests {
         ));
     }
 
-    // 帧头自描述：payload_len 与 orig_len 语义
+    // Self-describing frame header: payload_len vs orig_len semantics
     #[test]
     fn header_fields_semantics() {
         let plain = lorem(512);
@@ -492,25 +566,33 @@ mod tests {
         let orig = u32::from_le_bytes(frame[5..9].try_into().unwrap()) as usize;
         let plen = u32::from_le_bytes(frame[9..13].try_into().unwrap()) as usize;
         assert_eq!(orig, plain.len());
-        assert!(plen < orig, "可压缩输入的 payload 应小于原文");
+        assert!(
+            plen < orig,
+            "payload for compressible input should be smaller than the original"
+        );
         assert!(frame.len() >= FRAME_HEADER_LEN + plen);
     }
 
-    // 未认证帧头的 orig_len 上限：13B 头可声明 4GiB 诱导解压侧巨额容量预分配——
-    // 超会话帧上限（1MiB，§1.3.3c 单条记录上限）必须在分配前拒绝。
+    // orig_len cap on unauthenticated frame headers: the 13B header could
+    // declare 4GiB to lure the decompress side into a huge capacity
+    // pre-allocation — exceeding the session frame cap (1MiB, §1.3.3c
+    // single-record cap) must be rejected before allocation.
     #[test]
     fn oversized_declared_orig_len_rejected_before_alloc() {
         let cap_err =
             CompressError::MalformedFrame("declared orig_len exceeds 1MiB session frame cap");
-        // 伪造帧：flags=直通（保留位全零合法）、dict=0、orig_len=u32::MAX、payload_len=0。
+        // Forged frame: flags=passthrough (all-zero reserved bits is
+        // legal), dict=0, orig_len=u32::MAX, payload_len=0.
         let mut frame = vec![0u8; FRAME_HEADER_LEN];
         frame[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
             decompress_frame(&frame),
             Err(cap_err),
-            "超限 orig_len 必须在解压分配前拒绝"
+            "over-cap orig_len must be rejected before decompression allocation"
         );
-        // 恰在上限（1MiB）不走上限路径（后续由 payload/长度校验兜底——此处报长度不符）。
+        // Exactly at the cap (1MiB) does not take the cap-rejection path
+        // (subsequently backstopped by payload/length validation — here it
+        // reports a length mismatch).
         let mut edge = vec![0u8; FRAME_HEADER_LEN];
         edge[5..9].copy_from_slice(&(crate::session::MAX_FRAME as u32).to_le_bytes());
         assert_ne!(
@@ -518,7 +600,7 @@ mod tests {
             Err(CompressError::MalformedFrame(
                 "declared orig_len exceeds 1MiB session frame cap"
             )),
-            "恰在上限的 orig_len 不被上限路径拒绝"
+            "orig_len exactly at the cap is not rejected by the cap path"
         );
     }
 }

@@ -1,10 +1,12 @@
-# Rust 构建产物
+# Rust build artifacts
 /target
 
-# 库 crate 惯例：不提交 Cargo.lock（仅二进制 crate 提交）。
-# 引用方以语义化版本约束解析，锁文件由各下游自己的 workspace 维护。
+# Library-crate convention: do not commit Cargo.lock (only binary
+# crates commit it). Consumers resolve via semantic-version
+# constraints; the lockfile is maintained by each downstream's own
+# workspace.
 /Cargo.lock
 
-# 本地编辑器/系统杂项
+# Local editor/system clutter
 *.swp
 .DS_Store

@@ -1,30 +1,46 @@
-//! 文件信封 v2（混合封装 + 段序号 AAD）（docs/design.md §1.3.3b / §3.2，P0-1、P0-3）。
+//! File envelope v2 (hybrid encapsulation + segment-index AAD)
+//! (docs/design.md §1.3.3b / §3.2, P0-1, P0-3).
 //!
-//! v2 字节布局：
+//! v2 byte layout:
 //!
 //! ```text
-//! 头:  [1B ver=2][16B envelope_id][32B eph_x25519][1088B ml_kem_ct]   = 1137B
-//! 段:  [12B nonce][AES-256-GCM ct‖16B tag]，段明文 = 4MiB（末段可短）
+//! header: [1B ver=2][16B envelope_id][32B eph_x25519][1088B ml_kem_ct]   = 1137B
+//! segment: [12B nonce][AES-256-GCM ct‖16B tag], segment plaintext = 4MiB (last may be shorter)
 //! AAD: ver ‖ envelope_id ‖ seg_idx(u64 LE) ‖ is_final(u8 0/1)        = 26B
 //! ```
 //!
-//! - 一次性 k 由混合 KEM 派生（每信封新临时 X25519 + ML-KEM 份额 ⇒ 一次性信封获得
-//!   前向保密，verdict §3.3）；k 即 [`crate::kem::SealedShared`] 的 32B HKDF 输出。
-//! - **文档化安全前提**（§1.3.3b，verdict §3.4）：一次性 k + 每段随机 96-bit nonce ——
-//!   每密钥消息数 = n/4MiB ≪ 2^32，在 SP 800-38D 随机 IV 界内；长会话流量的计数器
-//!   nonce 纪律属隧道档（session 模块），两档分立。
-//! - AAD 把段序号+信封 ID+结束位绑进认证：段重排（seg_idx）、跨信封拼接（envelope_id）、
-//!   删尾（is_final）全部在解密侧被拒（v1 缺失，showroom-common lib.rs:396-411 本次核实）。
-//! - 流式恒定内存（沿用 showroom seal/open 缓冲模型，showroom-analysis §4.1）：
-//!   seal ≈ 1×SEG 缓冲 + 1 字节探测；open ≈ BufReader(SEG+28) + 1×(SEG+16) 密文缓冲。
-//! - 长度不变量：`total = 1137 + n + ceil(n/SEG) × (12+16)`（n = 明文字节数）。
-//! - 空输入合法：仅 1137B 头（0 字节明文，段数 0）。注意：空信封无段可认证，
-//!   头部收件人匹配性不可验证（0 字节明文无泄露面）；整体完整性按 showroom EtM 惯例
-//!   由调用方外层 SR-SIG1 哈希承担（security.md:84 同思路）。
-//! - 截断容错固有边界（showroom 同款）：解密逐段进行，前段已写出后段失败不回滚。
+//! - The one-time k is derived by the hybrid KEM (fresh ephemeral X25519 +
+//!   ML-KEM shares per envelope ⇒ one-time envelopes gain forward secrecy,
+//!   verdict §3.3); k is exactly the 32B HKDF output of
+//!   [`crate::kem::SealedShared`].
+//! - **Documented security premise** (§1.3.3b, verdict §3.4): one-time k +
+//!   fresh random 96-bit nonce per segment — messages per key = n/4MiB ≪
+//!   2^32, within the SP 800-38D random-IV bound; counter-nonce discipline
+//!   for long-lived session traffic belongs to the tunnel profile (the
+//!   session module); the two profiles stay separate.
+//! - The AAD binds segment index + envelope ID + final flag into
+//!   authentication: segment reordering (seg_idx), cross-envelope splicing
+//!   (envelope_id), and tail truncation (is_final) are all rejected on the
+//!   decrypt side (v1 lacked this — verified this round at showroom-common
+//!   lib.rs:396-411).
+//! - Streaming with constant memory (following the showroom seal/open
+//!   buffer model, showroom-analysis §4.1): seal ≈ 1×SEG buffer + 1 probe
+//!   byte; open ≈ BufReader(SEG+28) + 1×(SEG+16) ciphertext buffer.
+//! - Length invariant: `total = 1137 + n + ceil(n/SEG) × (12+16)` (n =
+//!   plaintext bytes).
+//! - Empty input is legal: just the 1137B header (0 plaintext bytes, 0
+//!   segments). Note: an empty envelope has no segment to authenticate and
+//!   header recipient-match cannot be verified (0 plaintext bytes present
+//!   no leak surface); overall integrity follows the showroom EtM
+//!   convention and is carried by the caller's outer SR-SIG1 hash (same
+//!   idea as security.md:84).
+//! - Inherent truncation-tolerance boundary (same as showroom): decryption
+//!   proceeds segment by segment; earlier segments already written are not
+//!   rolled back when a later segment fails.
 //!
-//! v1 只读兼容（`legacy` feature）：[`open_v1_legacy`] 解 `[384B RSA-OAEP-SHA256(k)] ||
-//! 段{[12B nonce][ct+tag]}`（无 AAD，showroom-common lib.rs:376-461 布局不变）。
+//! v1 read-only compatibility (`legacy` feature): [`open_v1_legacy`]
+//! decodes `[384B RSA-OAEP-SHA256(k)] || segments{[12B nonce][ct+tag]}`
+//! (no AAD; showroom-common lib.rs:376-461 layout unchanged).
 
 use std::io::{self, BufReader, Read, Write};
 
@@ -32,7 +48,8 @@ use aes_gcm::aead::inout::InOutBuf;
 use aes_gcm::aead::{AeadCore, AeadInOut, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce, Tag};
 
-/// 由 32B 原始钥构造 AES-256-GCM 钥匙（长度恒 32，try_from 仅查长度）。
+/// Build an AES-256-GCM key from the 32B raw key (length is always 32;
+/// try_from only checks length).
 fn key_of(raw: &[u8; KEY_LEN]) -> Key<Aes256Gcm> {
     Key::<Aes256Gcm>::try_from(&raw[..]).expect("32B AES-256 key")
 }
@@ -40,38 +57,42 @@ use rand::RngCore;
 
 use crate::kem::{self, HybridCt, HybridKeypair, HybridPubkey};
 
-/// AES-256 钥匙长度（v1 兼容常量，§1.3.2）。
+/// AES-256 key length (v1 compatibility constant, §1.3.2).
 pub const KEY_LEN: usize = 32;
-/// AES-GCM 96-bit nonce 长度（v1 兼容常量，§1.3.2）。
+/// AES-GCM 96-bit nonce length (v1 compatibility constant, §1.3.2).
 pub const NONCE_LEN: usize = 12;
-/// GCM 认证标签长度（v1 兼容常量，§1.3.2）。
+/// GCM authentication tag length (v1 compatibility constant, §1.3.2).
 pub const TAG_LEN: usize = 16;
-/// 每段明文 4MiB（v1 兼容常量，§1.3.2）。
+/// Per-segment plaintext 4MiB (v1 compatibility constant, §1.3.2).
 pub const SEG: usize = 4 * 1024 * 1024;
 
-/// v2 头版本字节。
+/// v2 header version byte.
 pub const V2_VER: u8 = 2;
-/// v2 头长度：1 + 16 + 32 + 1088 = 1137B。
+/// v2 header length: 1 + 16 + 32 + 1088 = 1137B.
 pub const V2_HEADER_LEN: usize = 1 + 16 + kem::X25519_PUB_LEN + kem::ML_KEM_CT_LEN;
-/// 段 AAD 长度：ver(1) + id(16) + seg_idx(8) + is_final(1)。
+/// Segment AAD length: ver(1) + id(16) + seg_idx(8) + is_final(1).
 pub const SEG_AAD_LEN: usize = 1 + 16 + 8 + 1;
 
-/// `legacy`：v1 封装头长度（RSA-3072 模长，§1.3.2）。
+/// `legacy`: v1 encapsulation header length (RSA-3072 modulus length,
+/// §1.3.2).
 #[cfg(feature = "legacy")]
 pub const WRAP_LEN: usize = 384;
 
-/// [`seal_v2`] 产物摘要：信封 ID / 段数 / 写出总字节数（含 1137B 头）。
+/// Summary of a [`seal_v2`] result: envelope ID / segment count / total
+/// bytes written (including the 1137B header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealInfo {
-    /// 16B 信封 ID（同时绑进每段 AAD）。
+    /// 16B envelope ID (also bound into every segment's AAD).
     pub envelope_id: [u8; 16],
-    /// 段数（空信封 = 0）。
+    /// Segment count (empty envelope = 0).
     pub segments: u64,
-    /// 写出总字节数（含头），= `1137 + n + segments × 28`。
+    /// Total bytes written (including the header) =
+    /// `1137 + n + segments × 28`.
     pub total_bytes: u64,
 }
 
-/// 段 AAD：`ver ‖ envelope_id ‖ seg_idx(u64 LE) ‖ is_final`（§1.3.3b；构造为内部实现细节，§3.2）。
+/// Segment AAD: `ver ‖ envelope_id ‖ seg_idx(u64 LE) ‖ is_final` (§1.3.3b;
+/// construction is an internal implementation detail, §3.2).
 fn seg_aad(ver: u8, envelope_id: &[u8; 16], seg_idx: u64, is_final: bool) -> [u8; SEG_AAD_LEN] {
     let mut a = [0u8; SEG_AAD_LEN];
     a[0] = ver;
@@ -81,7 +102,8 @@ fn seg_aad(ver: u8, envelope_id: &[u8; 16], seg_idx: u64, is_final: bool) -> [u8
     a
 }
 
-/// v2 加密封装（流式，恒定内存）。随机性：envelope_id / 混合 KEM 临时份额 / 每段 nonce 均 OsRng。
+/// v2 sealing (streaming, constant memory). Randomness: envelope_id /
+/// hybrid KEM ephemeral shares / per-segment nonce all from OsRng.
 pub fn seal_v2<W: Write>(
     recipient: &HybridPubkey,
     mut plain: impl Read,
@@ -91,11 +113,13 @@ pub fn seal_v2<W: Write>(
     let mut envelope_id = [0u8; 16];
     rng.fill_bytes(&mut envelope_id);
 
-    // 一次性 k：混合封装（每信封新临时份额 ⇒ 前向保密）
+    // One-time k: hybrid encapsulation (fresh ephemeral shares per envelope
+    // ⇒ forward secrecy)
     let (shared, ct) = kem::encapsulate(recipient, &mut rng);
     let cipher = Aes256Gcm::new(&key_of(shared.as_bytes()));
 
-    // 头 1137B：ver | envelope_id | HybridCt（= eph_x25519 32B ‖ ml_kem_ct 1088B，顺序 §1.3.3b）
+    // Header 1137B: ver | envelope_id | HybridCt (= eph_x25519 32B ‖
+    // ml_kem_ct 1088B, order per §1.3.3b)
     out.write_all(&[V2_VER])?;
     out.write_all(&envelope_id)?;
     out.write_all(&ct.to_bytes())?;
@@ -104,7 +128,8 @@ pub fn seal_v2<W: Write>(
     let mut buf = vec![0u8; SEG];
     let mut seg_idx: u64 = 0;
     let mut segments: u64 = 0;
-    // 1 字节探测位：满段后探读 1B 判定 is_final，避免第二块 4MiB 缓冲（恒定内存）
+    // 1 probe byte: after a full segment, probe-read 1B to decide
+    // is_final, avoiding a second 4MiB buffer (constant memory)
     let mut carry: u8 = 0;
     let mut carry_len: usize = 0;
     loop {
@@ -115,7 +140,8 @@ pub fn seal_v2<W: Write>(
             read_full(&mut plain, &mut buf)?
         };
         if n == 0 {
-            break; // 干净收尾（上一次写入的已是末段；首读即 0 = 空信封）
+            break; // clean finish (the previous write was already the last
+                   // segment; a 0 first read = empty envelope)
         }
         let is_final = if n < SEG {
             true
@@ -157,8 +183,10 @@ pub fn seal_v2<W: Write>(
     })
 }
 
-/// v2 解封（流式，恒定内存）。返回写出明文总字节数；任何 ver/头长/段认证失败返回 Err（不 panic）。
-/// 空信封（仅 1137B 头）合法，返回 0。
+/// v2 opening (streaming, constant memory). Returns total plaintext bytes
+/// written; any ver/header-length/segment authentication failure returns
+/// Err (no panic). An empty envelope (1137B header only) is legal and
+/// returns 0.
 pub fn open_v2(sk: &HybridKeypair, sealed: impl Read, mut out: impl Write) -> io::Result<u64> {
     let mut r = BufReader::with_capacity(SEG + NONCE_LEN + TAG_LEN, sealed);
 
@@ -192,7 +220,7 @@ pub fn open_v2(sk: &HybridKeypair, sealed: impl Read, mut out: impl Write) -> io
     let mut total: u64 = 0;
 
     match read_full(&mut r, &mut nonce)? {
-        0 => return Ok(0), // 空信封：段边界上的干净 EOF
+        0 => return Ok(0), // empty envelope: clean EOF at a segment boundary
         NONCE_LEN => {}
         _ => {
             return Err(io::Error::new(
@@ -209,7 +237,9 @@ pub fn open_v2(sk: &HybridKeypair, sealed: impl Read, mut out: impl Write) -> io
                 "envelope: truncated segment",
             ));
         }
-        // 末段判定：前瞻探读下一 nonce（EOF ⇒ 本段为末段；AAD 绑 is_final ⇒ 删尾被拒）
+        // Final-segment decision: look ahead to the next nonce (EOF ⇒ this
+        // segment is final; is_final is bound into the AAD ⇒ tail
+        // truncation is rejected)
         let is_final = match read_full(&mut r, &mut next_nonce)? {
             0 => true,
             NONCE_LEN => false,
@@ -246,9 +276,11 @@ pub fn open_v2(sk: &HybridKeypair, sealed: impl Read, mut out: impl Write) -> io
     }
 }
 
-/// `legacy`：v1 只读解封（showroom `seal` 产物；布局 §1.3.2，`[384B RSA-OAEP-SHA256(k)] ||
-/// 段{[12B nonce][ct+16B tag]}`，**无 AAD**——正是 v2 段 AAD 修的缺陷，P0-3）。
-/// 返回写出明文总字节数；空信封（仅 384B 头）合法，返回 0。
+/// `legacy`: v1 read-only opening (product of showroom `seal`; layout per
+/// §1.3.2, `[384B RSA-OAEP-SHA256(k)] || segments{[12B nonce][ct+16B
+/// tag]}`, **no AAD** — precisely the defect the v2 segment AAD fixes,
+/// P0-3). Returns total plaintext bytes written; an empty envelope (384B
+/// header only) is legal and returns 0.
 #[cfg(feature = "legacy")]
 pub fn open_v1_legacy(
     platform_priv: &rsa::RsaPrivateKey,
@@ -277,7 +309,7 @@ pub fn open_v1_legacy(
     let mut total: u64 = 0;
     loop {
         match read_full(&mut r, &mut nonce)? {
-            0 => return Ok(total), // 干净收尾（段边界上的 EOF）
+            0 => return Ok(total), // clean finish (EOF at a segment boundary)
             NONCE_LEN => {}
             _ => {
                 return Err(io::Error::new(
@@ -298,7 +330,7 @@ pub fn open_v1_legacy(
         cipher
             .decrypt_inout_detached(
                 &Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::from(nonce),
-                b"", // v1 无 AAD（保持逐字节兼容）
+                b"", // v1 has no AAD (kept byte-for-byte compatible)
                 InOutBuf::from(&mut *msg),
                 &Tag::<<Aes256Gcm as AeadCore>::TagSize>::from(tag_arr),
             )
@@ -310,11 +342,14 @@ pub fn open_v1_legacy(
     }
 }
 
-// ———— v1 写入侧 + 平台 RSA 密钥对（`legacy`；§1.3.2 兼容面，showroom 迁移窗口内继续写 v1）————
+// ———— v1 write side + platform RSA keypair (`legacy`; §1.3.2 compatibility
+// surface, showroom keeps writing v1 during the migration window) ————
 
-/// rand 0.9（本库 RNG 面）→ rsa 0.9.10 的 rand_core 0.6 代际私有桥
-/// （rsa keygen / OAEP padding 的 `CryptoRngCore` 参数；pake 模块 RngBridge08 同思路）。
-/// 熵源故障直接 panic（同本库其它桥的语义）。
+/// Private rand 0.9 (this library's RNG surface) → rsa 0.9.10's rand_core
+/// 0.6 generation bridge (for the `CryptoRngCore` parameters of rsa
+/// keygen / OAEP padding; same idea as the pake module's RngBridge08).
+/// Entropy-source failure panics directly (same semantics as this
+/// library's other bridges).
 #[cfg(feature = "legacy")]
 struct Rng06<'a, R: rand::TryRngCore + ?Sized>(&'a mut R);
 
@@ -345,11 +380,15 @@ impl<R: rand::TryRngCore + ?Sized> rsa::rand_core::RngCore for Rng06<'_, R> {
 #[cfg(feature = "legacy")]
 impl<R: rand::TryRngCore + ?Sized> rsa::rand_core::CryptoRng for Rng06<'_, R> {}
 
-/// `legacy`：v1 加密封装（showroom `seal` 原样，§1.3.2 签名不变）。
-/// 布局 `[384B RSA-OAEP-SHA256 封装的 k] || 每段[12B nonce][密文+16B tag]`，段=4MiB 明文，
-/// **无 AAD**（v1 固有缺陷由 v2 段序号 AAD 修，P0-3；此处保持逐字节兼容，不改）。
-/// 返回写出的总字节数（含 384B 封装头）。迁移窗口内 showroom 继续写 v1（§1.3.3a：
-/// 真正的过渡 = 继续写 v1、永远可读 v1）。zstd 压缩不在本 crate（调用方管道自行组合）。
+/// `legacy`: v1 sealing (verbatim showroom `seal`, §1.3.2 signature
+/// unchanged). Layout `[384B RSA-OAEP-SHA256-wrapped k] || per segment [12B
+/// nonce][ct+16B tag]`, segment = 4MiB plaintext, **no AAD** (the inherent
+/// v1 defect is fixed by the v2 segment-index AAD, P0-3; kept
+/// byte-for-byte compatible here, unchanged). Returns total bytes written
+/// (including the 384B encapsulation header). During the migration window
+/// showroom keeps writing v1 (§1.3.3a: the real transition = keep writing
+/// v1, always able to read v1). zstd compression is not in this crate
+/// (callers compose their own pipeline).
 #[cfg(feature = "legacy")]
 pub fn seal_v1_legacy<W: Write>(
     platform_pub: &rsa::RsaPublicKey,
@@ -386,7 +425,7 @@ pub fn seal_v1_legacy<W: Write>(
         let tag = cipher
             .encrypt_inout_detached(
                 &Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::from(nonce),
-                b"", // v1 无 AAD（保持逐字节兼容）
+                b"", // v1 has no AAD (kept byte-for-byte compatible)
                 InOutBuf::from(&mut buf[..n]),
             )
             .map_err(|_| io::Error::other("aes-gcm encrypt segment"))?;
@@ -397,31 +436,35 @@ pub fn seal_v1_legacy<W: Write>(
     }
 }
 
-/// `legacy`：平台 RSA-3072 密钥对（showroom `PlatformKeys` 原样，§1.3.2）。
-/// v1 信封的收件人密钥（seal 用公钥 / open 用私钥）。
+/// `legacy`: platform RSA-3072 keypair (verbatim showroom `PlatformKeys`,
+/// §1.3.2). The recipient key of v1 envelopes (seal with the public key /
+/// open with the private key).
 #[cfg(feature = "legacy")]
 pub struct PlatformKeys(rsa::RsaPrivateKey);
 
 #[cfg(feature = "legacy")]
 impl PlatformKeys {
-    /// 生成 RSA-3072（模长 384B = v1 封装头长度契约）。
+    /// Generate an RSA-3072 (modulus length 384B = the v1 encapsulation
+    /// header length contract).
     pub fn generate() -> Self {
         let mut rng = rand::rng();
         PlatformKeys(rsa::RsaPrivateKey::new(&mut Rng06(&mut rng), 3072).expect("rsa-3072 keygen"))
     }
 
-    /// 私钥（传给 [`open_v1_legacy`]；showroom 调用方亦经再导出的 rsa crate 从 PEM 自行构造）。
+    /// The private key (passed to [`open_v1_legacy`]; showroom callers also
+    /// construct it themselves from PEM via the re-exported rsa crate).
     pub fn private(&self) -> &rsa::RsaPrivateKey {
         &self.0
     }
 
-    /// 公钥（传给 [`seal_v1_legacy`]）。
+    /// The public key (passed to [`seal_v1_legacy`]).
     pub fn public(&self) -> rsa::RsaPublicKey {
         self.0.to_public_key()
     }
 
-    /// 写 `<dir>/platform_rsa`（PKCS#8 PEM，0600）与 `<dir>/platform_rsa.pub`，返回私钥路径。
-    /// unix 平台专属（0600 权限语义；wasm32 无文件系统）。
+    /// Write `<dir>/platform_rsa` (PKCS#8 PEM, 0600) and
+    /// `<dir>/platform_rsa.pub`; returns the private key path. Unix-only
+    /// (0600 permission semantics; wasm32 has no filesystem).
     #[cfg(unix)]
     pub fn save_pem(&self, dir: &std::path::Path) -> crate::compat::Result<std::path::PathBuf> {
         use rsa::pkcs8::{EncodePrivateKey, LineEnding};
@@ -433,7 +476,7 @@ impl PlatformKeys {
         Ok(priv_path)
     }
 
-    /// 读 `<dir>/platform_rsa`（PKCS#8 PEM）。
+    /// Read `<dir>/platform_rsa` (PKCS#8 PEM).
     pub fn load_pem(dir: &std::path::Path) -> crate::compat::Result<Self> {
         use rsa::pkcs8::DecodePrivateKey;
 
@@ -441,7 +484,7 @@ impl PlatformKeys {
         Ok(PlatformKeys(rsa::RsaPrivateKey::from_pkcs8_pem(&pem)?))
     }
 
-    /// 公钥 PEM（SPKI，`-----BEGIN PUBLIC KEY-----`）。
+    /// Public key PEM (SPKI, `-----BEGIN PUBLIC KEY-----`).
     pub fn public_pem(&self) -> String {
         use rsa::pkcs8::{EncodePublicKey, LineEnding};
 
@@ -454,7 +497,8 @@ impl PlatformKeys {
     }
 }
 
-/// 循环 read 直至填满 buf 或 EOF，返回已读字节数（管道短读安全；showroom lib.rs:464-473 同款）。
+/// Read in a loop until buf is full or EOF; returns bytes read (safe
+/// against short pipe reads; same as showroom lib.rs:464-473).
 fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut off = 0;
     while off < buf.len() {
@@ -482,7 +526,9 @@ mod tests {
         (sealed, info)
     }
 
-    // 5. seal→open 往返：空 / 恰好 4MiB / >8MiB（跨多段），并核对总长不变量（§3.2 长度不变量测试）
+    // 5. seal→open round trip: empty / exactly 4MiB / >8MiB (multi
+    // segment), plus the total-length invariant (§3.2 length-invariant
+    // test)
     #[test]
     fn v2_roundtrip_and_length_invariant() {
         let sk = keypair();
@@ -494,10 +540,14 @@ mod tests {
             assert_eq!(
                 info.total_bytes as usize,
                 HDR + len + (segs as usize) * (NONCE_LEN + TAG_LEN),
-                "v2 长度不变量: 1137 + n + ceil(n/4MiB)*28"
+                "v2 length invariant: 1137 + n + ceil(n/4MiB)*28"
             );
             assert_eq!(info.segments, segs);
-            assert_eq!(&sealed[1..17], &info.envelope_id, "SealInfo.id 与头一致");
+            assert_eq!(
+                &sealed[1..17],
+                &info.envelope_id,
+                "SealInfo.id matches the header"
+            );
             assert_eq!(sealed[0], V2_VER);
             let mut out = Vec::new();
             let m = open_v2(&sk, Cursor::new(sealed.as_slice()), &mut out).unwrap();
@@ -506,7 +556,8 @@ mod tests {
         }
     }
 
-    // 恰好 2×SEG（末段为满段）——is_final 必须由前瞻/探针判定而非「短段即末段」
+    // Exactly 2×SEG (last segment is a full segment) — is_final must be
+    // decided by the lookahead/probe, not by "short segment = final"
     #[test]
     fn v2_full_multiple_roundtrip() {
         let sk = keypair();
@@ -522,7 +573,8 @@ mod tests {
         assert_eq!(out, plain);
     }
 
-    // 6. 篡改：头密文区 / 段密文区 → 报错不 panic
+    // 6. Tampering: header ciphertext region / segment ciphertext region →
+    // error, no panic
     #[test]
     fn v2_tamper_rejected() {
         let sk = keypair();
@@ -530,18 +582,22 @@ mod tests {
         let (sealed, _) = seal(&plain, &sk.public());
 
         let mut t = sealed.clone();
-        t[HDR + NONCE_LEN + 10] ^= 1; // 第一段密文区
+        t[HDR + NONCE_LEN + 10] ^= 1; // first segment's ciphertext region
         let mut out = Vec::new();
         assert!(open_v2(&sk, Cursor::new(t.as_slice()), &mut out).is_err());
-        assert!(out.is_empty(), "首段失败无已写出内容");
+        assert!(
+            out.is_empty(),
+            "no written content after a first-segment failure"
+        );
 
         let mut t2 = sealed;
-        t2[100] ^= 1; // 头 ml_kem_ct 区 ⇒ 解出错误 k ⇒ 段认证失败
+        t2[100] ^= 1; // header ml_kem_ct region ⇒ wrong k derived ⇒ segment auth fails
         let mut out2 = Vec::new();
         assert!(open_v2(&sk, Cursor::new(t2.as_slice()), &mut out2).is_err());
     }
 
-    // 版本字节分派：ver=1 / ver=3 的头 → 拒（§3.2 接缝：ver 字节分派 v1/v2）
+    // Version byte dispatch: headers with ver=1 / ver=3 → rejected (§3.2
+    // seam: the ver byte dispatches v1/v2)
     #[test]
     fn v2_version_dispatch() {
         let sk = keypair();
@@ -552,20 +608,21 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         sealed[0] = 3;
         assert!(open_v2(&sk, Cursor::new(sealed.as_slice()), &mut out).is_err());
-        // 头截断
+        // truncated header
         let (s2, _) = seal(b"x", &sk.public());
         assert!(open_v2(&sk, Cursor::new(&s2[..1136]), &mut out).is_err());
     }
 
-    // P0-3 守门用例：段重排必须失败（seg_idx 绑 AAD）
+    // P0-3 gate case: segment reordering must fail (seg_idx bound into the
+    // AAD)
     #[test]
     fn v2_segment_reorder_rejected() {
         let sk = keypair();
-        let plain: Vec<u8> = (0..(SEG as u32 * 3)).map(|i| (i % 251) as u8).collect(); // 3 段全满
+        let plain: Vec<u8> = (0..(SEG as u32 * 3)).map(|i| (i % 251) as u8).collect(); // 3 full segments
         let (sealed, info) = seal(&plain, &sk.public());
         assert_eq!(info.segments, 3);
-        let blk = SEG + NONCE_LEN + TAG_LEN; // 每段线上块长（满段）
-                                             // 交换段 0 与段 1
+        let blk = SEG + NONCE_LEN + TAG_LEN; // per-segment wire block length (full)
+                                             // swap segment 0 and segment 1
         let mut t = sealed.clone();
         let (a, b) = (HDR..HDR + blk, HDR + blk..HDR + 2 * blk);
         let sa: Vec<u8> = sealed[a.clone()].to_vec();
@@ -575,29 +632,33 @@ mod tests {
         let mut out = Vec::new();
         assert!(
             open_v2(&sk, Cursor::new(t.as_slice()), &mut out).is_err(),
-            "段重排必须被 AAD(seg_idx) 拒绝"
+            "segment reordering must be rejected by AAD(seg_idx)"
         );
     }
 
-    // P0-3 守门用例：删尾必须在解密侧失败（is_final 绑 AAD）
+    // P0-3 gate case: tail truncation must fail on the decrypt side
+    // (is_final bound into the AAD)
     #[test]
     fn v2_truncation_rejected() {
         let sk = keypair();
-        let plain = vec![5u8; SEG * 2 + 1234]; // 3 段：2 满 + 1 短
+        let plain = vec![5u8; SEG * 2 + 1234]; // 3 segments: 2 full + 1 short
         let (sealed, info) = seal(&plain, &sk.public());
         assert_eq!(info.segments, 3);
-        // 在第 2 段边界截断（丢掉末段）：末段位标记不匹配 ⇒ 拒
+        // Truncate at the 2nd segment boundary (dropping the last
+        // segment): the final flag mismatches ⇒ rejected
         let cut = HDR + 2 * (SEG + NONCE_LEN + TAG_LEN);
         let mut out = Vec::new();
         assert!(
             open_v2(&sk, Cursor::new(&sealed[..cut]), &mut out).is_err(),
-            "删尾必须被 AAD(is_final) 拒绝"
+            "tail truncation must be rejected by AAD(is_final)"
         );
-        // 顺带：非段边界截断（nonce 读半截）也必须报错
+        // Incidentally: truncation off a segment boundary (half a nonce
+        // read) must also error
         assert!(open_v2(&sk, Cursor::new(&sealed[..cut + 5]), &mut out).is_err());
     }
 
-    // P0-3 守门用例：跨信封拼接必须失败（envelope_id 绑 AAD）——同收件人两个信封互拼段
+    // P0-3 gate case: cross-envelope splicing must fail (envelope_id bound
+    // into the AAD) — two envelopes to the same recipient, segments spliced
     #[test]
     fn v2_splice_rejected() {
         let sk = keypair();
@@ -610,20 +671,22 @@ mod tests {
                 b.copy_from_slice(&env_b[1..17]);
                 b
             },
-            "两信封 id 必不同"
+            "the two envelope ids must differ"
         );
         let blk = SEG + NONCE_LEN + TAG_LEN;
-        // 用 B 的段替换 A 的段（同收件人、同 seg_idx、同 is_final——只有 id 不同）
+        // Replace A's segment with B's (same recipient, same seg_idx, same
+        // is_final — only the id differs)
         let mut t = env_a.clone();
         t[HDR..HDR + blk].copy_from_slice(&env_b[HDR..HDR + blk]);
         let mut out = Vec::new();
         assert!(
             open_v2(&sk, Cursor::new(t.as_slice()), &mut out).is_err(),
-            "跨信封拼接必须被 AAD(envelope_id) 拒绝"
+            "cross-envelope splicing must be rejected by AAD(envelope_id)"
         );
     }
 
-    // 非收件人解不开：错误混合私钥 ⇒ 段认证失败
+    // A non-recipient cannot open: wrong hybrid private key ⇒ segment auth
+    // fails
     #[test]
     fn v2_wrong_recipient_rejected() {
         let (sk, other) = (keypair(), keypair());
@@ -632,7 +695,8 @@ mod tests {
         assert!(open_v2(&other, Cursor::new(sealed.as_slice()), &mut out).is_err());
     }
 
-    // 一次性语义：同明文两次封装 ⇒ 密文不同（新临时份额 + 随机 id/nonce）
+    // One-time semantics: sealing the same plaintext twice ⇒ different
+    // ciphertext (fresh ephemeral shares + random id/nonce)
     #[test]
     fn v2_freshness() {
         let sk = keypair();
@@ -642,7 +706,7 @@ mod tests {
     }
 }
 
-// ———— v1 写入侧（`legacy`；seal_v1_legacy / PlatformKeys）————
+// ———— v1 write side (`legacy`; seal_v1_legacy / PlatformKeys) ————
 #[cfg(all(test, feature = "legacy"))]
 mod v1_tests {
     use super::*;
@@ -653,8 +717,10 @@ mod v1_tests {
         K.get_or_init(PlatformKeys::generate)
     }
 
-    // seal_v1_legacy → open_v1_legacy 往返：空 / 恰好 4MiB / >8MiB（跨多段），并核对封装总长
-    // （长度不变量：384 + n + ceil(n/4MiB)×28；showroom lib.rs:578 测试思想平移）
+    // seal_v1_legacy → open_v1_legacy round trip: empty / exactly 4MiB /
+    // >8MiB (multi segment), plus the encapsulation total length (length
+    // invariant: 384 + n + ceil(n/4MiB)×28; idea ported from showroom
+    // lib.rs:578 test)
     #[test]
     fn v1_seal_open_roundtrip_and_length_invariant() {
         let p = platform();
@@ -672,8 +738,9 @@ mod v1_tests {
         }
     }
 
-    // sealed 输入翻转一个字节（密文区 / 封装头区）→ 报错不 panic
-    // （showroom lib.rs:587-604 tampered_envelope_rejected 平移）
+    // Flip one byte of the sealed input (ciphertext region / encapsulation
+    // header region) → error, no panic (ported from showroom lib.rs:587-604
+    // tampered_envelope_rejected)
     #[test]
     fn v1_tampered_envelope_rejected() {
         let p = platform();
@@ -682,19 +749,20 @@ mod v1_tests {
         seal_v1_legacy(&p.public(), Cursor::new(plain.as_slice()), &mut sealed).unwrap();
 
         let mut t = sealed.clone();
-        t[WRAP_LEN + NONCE_LEN + 10] ^= 1; // 第一段密文区内
+        t[WRAP_LEN + NONCE_LEN + 10] ^= 1; // inside the first segment's ciphertext
         let mut out = Vec::new();
         let e = open_v1_legacy(p.private(), Cursor::new(t.as_slice()), &mut out);
         assert!(e.is_err(), "flipped ciphertext byte must error");
         assert!(out.is_empty());
 
         let mut t2 = sealed;
-        t2[10] ^= 1; // 384B 封装头内
+        t2[10] ^= 1; // inside the 384B encapsulation header
         let mut out2 = Vec::new();
         assert!(open_v1_legacy(p.private(), Cursor::new(t2.as_slice()), &mut out2).is_err());
     }
 
-    // PlatformKeys::save_pem/load_pem/public_pem 往返（unix 文件接缝）
+    // PlatformKeys::save_pem/load_pem/public_pem round trip (unix file
+    // seam)
     #[cfg(unix)]
     #[test]
     fn v1_platform_pem_roundtrip() {

@@ -1,22 +1,37 @@
-//! 多路复用与 EOF 语义（docs/design.md §1.3.3d / §3.6，P1-9、VPN-14/16 协议侧）。
+//! Multiplexing and EOF semantics (docs/design.md §1.3.3d / §3.6, P1-9,
+//! VPN-14/16 protocol side).
 //!
-//! - 复用器 = **rust-yamux 0.14.1**（hashicorp 规范实现；选型依据 vpn-mesh §4.1/S29/S30），
-//!   跑在 session 记录层加密**之内**——流数/流元数据对中转不可见。链路次序：
-//!   `TCP → 记录层（计数器 nonce AEAD）→ yamux → 逻辑流`。
-//! - **禁依赖 TCP 半关闭**（frp T3 实证 SHUT_WR 整链即拆，frp-compat §1.5）：单向结束一律
-//!   yamux FIN——即 [`Stream::finish`]；本包装类型**不实现** `poll_shutdown` 半关闭路径
-//!   （底层 yamux `poll_close` 语义 = 发 FIN，仅在 `finish()` 内调用）。
-//! - **心跳（§1.3.3d「keepalive = yamux ping 10s」的实现注记，如实声明）**：yamux 0.14.1
-//!   的公开 API 只有 `Connection::poll_*`，**不暴露 ping 发起**（`on_ping` 仅应答入站
-//!   ping；旧版 `Control::set_keep_alive_interval` 在 0.14 API 重构中移除，本次源码核实
-//!   yamux-0.14.1/src/lib.rs Config 字段与 connection.rs）。故 10s 心跳由 session 记录层的
-//!   加密 PING/PONG 帧承担（crypto-2026 §6.4 原始建议形态：保活帧本身也是加密帧），
-//!   兼作中转探活；对端 yamux 若主动 ping，本侧 yamux 仍按规范自动应答。
-//! - **优先级（如实声明）**：yamux 0.14.1 无流间调度优先级接口（帧发送在
-//!   `Stream::poll_write` 内直接入队，无重排钩子）。M1 的「控制流高优先级」落位在 session
-//!   记录层——会话控制记录（REKEY/PING/PONG）走独立高优先级通道，先于全部流数据下发
-//!   （session::write_pump biased select）；[`Prio`] 是流级预留位，仅记录不重排。
-//! - [`PacketChannel`]：TUN 包专用帧化 `[u16 len][ip packet]`（保边界），VPN-14 的库侧接口。
+//! - The multiplexer = **rust-yamux 0.14.1** (the hashicorp-spec
+//!   implementation; selection basis vpn-mesh §4.1/S29/S30), running
+//!   **inside** the session record-layer encryption — stream counts/stream
+//!   metadata are invisible to the relay. Link order:
+//!   `TCP → record layer (counter-nonce AEAD) → yamux → logical streams`.
+//! - **TCP half-close is forbidden** (frp T3 proved SHUT_WR tears down the
+//!   whole chain, frp-compat §1.5): unidirectional finish is always a
+//!   yamux FIN — i.e. [`Stream::finish`]; this wrapper type deliberately
+//!   does **not** implement the `poll_shutdown` half-close path (the
+//!   underlying yamux `poll_close` semantics = send FIN, called only
+//!   inside `finish()`).
+//! - **Heartbeats (implementation note for §1.3.3d "keepalive = yamux ping
+//!   10s", stated honestly)**: yamux 0.14.1's public API exposes only
+//!   `Connection::poll_*` and **no ping initiation** (`on_ping` only
+//!   answers inbound pings; the old `Control::set_keep_alive_interval`
+//!   was removed in the 0.14 API refactor — verified this round against
+//!   the yamux-0.14.1/src/lib.rs Config fields and connection.rs). Hence
+//!   the 10s heartbeat is carried by encrypted PING/PONG frames on the
+//!   session record layer (crypto-2026 §6.4's originally recommended
+//!   shape: keepalive frames are themselves encrypted frames), doubling
+//!   as a relay liveness probe; if the peer's yamux pings proactively,
+//!   this side's yamux still answers automatically per the spec.
+//! - **Priorities (stated honestly)**: yamux 0.14.1 has no inter-stream
+//!   scheduling priority interface (frame sends enqueue directly inside
+//!   `Stream::poll_write`, no reordering hook). M1's "control streams
+//!   high priority" lands in the session record layer — session control
+//!   records (REKEY/PING/PONG) take a dedicated high-priority channel and
+//!   go out before all stream data (session::write_pump biased select);
+//!   [`Prio`] is a stream-level reserved slot — recorded, never reordered.
+//! - [`PacketChannel`]: TUN-packet framing `[u16 len][ip packet]`
+//!   (boundary-preserving), the library-side interface of VPN-14.
 
 use std::future::Future;
 use std::io;
@@ -26,22 +41,26 @@ use std::task::{Context, Poll};
 use futures::io::{AsyncRead, AsyncWrite};
 use futures::{ready, Stream as FStream, StreamExt as _};
 
-/// 逻辑流优先级档位（§3.6 `Prio` 调度档）。
+/// Logical-stream priority tier (§3.6 `Prio` scheduling tier).
 ///
-/// M1 语义（见模块文档「优先级」注记）：[`Prio::Control`] 流登记为控制用途；
-/// 会话级控制记录（rekey/心跳）始终先于流数据下发。
+/// M1 semantics (see the module doc's "priorities" note):
+/// [`Prio::Control`] streams register as control-purpose; session-level
+/// control records (rekey/heartbeat) always go out before stream data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prio {
-    /// 控制流档（OPAQUE 登录/配置下发等信令流）。
+    /// Control-stream tier (signaling streams such as OPAQUE
+    /// login/config delivery).
     Control,
-    /// 普通数据档（默认）。
+    /// Ordinary data tier (default).
     Normal,
 }
 
-/// yamux 之上的逻辑流（包装 [`yamux::Stream`]，§3.6 接口：AsyncRead/Write + 显式 finish）。
+/// A logical stream over yamux (wrapping [`yamux::Stream`]; §3.6
+/// interface: AsyncRead/Write + explicit finish).
 ///
-/// EOF 语义：`finish()` = 发送 yamux FIN（单向结束），**绝不触碰 TCP 半关闭**；
-/// 对端读到 0 字节即收到 EOF。整流全关由会话层 teardown 承担。
+/// EOF semantics: `finish()` = send a yamux FIN (unidirectional finish),
+/// **never touching TCP half-close**; the peer observes EOF upon reading 0
+/// bytes. Whole-stream close is handled by the session-layer teardown.
 pub struct Stream {
     inner: yamux::Stream,
     prio: Prio,
@@ -52,44 +71,52 @@ impl Stream {
         Stream { inner, prio }
     }
 
-    /// 流 ID（yamux：客户端打开的流为奇数、服务器打开为偶数；客户端**首条流 = 1**）。
+    /// Stream ID (yamux: client-opened streams are odd, server-opened
+    /// even; the client's **first stream = 1**).
     ///
-    /// 供装配层做流分派（§3.12：首流 = 控制流）——按 ID 分派对 yamux 的惰性 SYN
-    /// （流在首帧数据前不物化）免疫：被静默持有的控制流（id=1）即使从未物化，
-    /// 后续物化的数据流（id≥3）也能被正确识别为数据面。
+    /// For the assembly layer's stream dispatch (§3.12: first stream =
+    /// control stream) — dispatching by ID is immune to yamux's lazy SYN
+    /// (streams materialize only on first-frame data): a control stream
+    /// silently held (id=1) never materializes, yet later materializing
+    /// data streams (id>=3) are still correctly recognized as data-plane.
     pub fn id(&self) -> u32 {
         self.inner.id().val()
     }
 
-    /// 取回内部 yamux 流（inbound 暂存回退路径用，库外无意义）。
+    /// Take back the inner yamux stream (for the inbound parking fallback
+    /// path; meaningless outside the library).
     pub(crate) fn into_inner(self) -> yamux::Stream {
         self.inner
     }
 
-    /// 该流的优先级档位。
+    /// This stream's priority tier.
     pub fn prio(&self) -> Prio {
         self.prio
     }
 
-    /// 显式单向结束：发送 yamux FIN（§1.3.3d 禁半关闭——FIN 是唯一 sanctioned 路径）。
-    /// 之后的 [`Stream::write_all`] 返回错误；对端读端将观察到 EOF。
+    /// Explicit unidirectional finish: send a yamux FIN (§1.3.3d forbids
+    /// half-close — FIN is the only sanctioned path). Subsequent
+    /// [`Stream::write_all`] returns an error; the peer's read side will
+    /// observe EOF.
     pub async fn finish(&mut self) -> io::Result<()> {
         futures::AsyncWriteExt::close(&mut self.inner).await
     }
 
-    /// 写全部字节（分片 ≤ 记录层单帧上限由 MuxIo 内部处理）。
+    /// Write all bytes (chunking ≤ the record-layer single-frame cap is
+    /// handled inside MuxIo).
     pub async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         futures::AsyncWriteExt::write_all(&mut self.inner, buf).await
     }
 
-    /// 读满 `buf`；对端 FIN 后不足即 `UnexpectedEof`，0 长度 buf 立即 Ok。
+    /// Read exactly `buf.len()` bytes; short reads after the peer's FIN
+    /// give `UnexpectedEof`; a 0-length buf returns Ok immediately.
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         futures::AsyncReadExt::read_exact(&mut self.inner, buf)
             .await
             .map(|_| ())
     }
 
-    /// 读至多 `buf.len()` 字节；`Ok(0)` = 对端 FIN（EOF）。
+    /// Read at most `buf.len()` bytes; `Ok(0)` = peer FIN (EOF).
     pub async fn read_some(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         futures::AsyncReadExt::read(&mut self.inner, buf).await
     }
@@ -118,7 +145,9 @@ impl AsyncWrite for Stream {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    /// **不支持**（禁半关闭：不提供隐式 shutdown 路径，单向结束必须显式 [`Stream::finish`]）。
+    /// **Not supported** (half-close forbidden: no implicit shutdown path
+    /// is provided; unidirectional finish must be an explicit
+    /// [`Stream::finish`]).
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -127,23 +156,29 @@ impl AsyncWrite for Stream {
     }
 }
 
-/// TUN 包通道（§1.3.6/§3.6 `PacketChannel`，VPN-14 库侧接口）。
+/// TUN packet channel (§1.3.6/§3.6 `PacketChannel`, the VPN-14
+/// library-side interface).
 ///
-/// 帧化：`[u16 LE len][ip packet]`（保包边界）。单包上限 65535B（u16 长度域）；
-/// 部署形态 MTU 1280（§2.1）远小于该上限。
+/// Framing: `[u16 LE len][ip packet]` (packet-boundary preserving).
+/// Single-packet cap 65535B (u16 length field); the deployment-form MTU
+/// of 1280 (§2.1) is far below it.
 pub struct PacketChannel {
     stream: Stream,
 }
 
-/// 单包长度上限（帧头 u16）。
+/// Single-packet length cap (u16 frame header).
 pub const MAX_PACKET: usize = u16::MAX as usize;
 
-/// 发一个包帧（`[u16 LE len][pkt]`；与 [`PacketChannel::send`] 同一线上格式）。
+/// Send one packet frame (`[u16 LE len][pkt]`; same wire format as
+/// [`PacketChannel::send`]).
 ///
-/// 独立函数形态供「读/写分离 + 专职任务」的装配使用——select 循环内直接 await
-/// [`PacketChannel::recv`] **不具备取消安全**（帧化是两次 read_exact：半途 future
-/// 被丢弃 ⇒ 已消费的帧头/帧体字节丢失，帧流永久失步）。写侧无此问题：写完整帧
-/// 在分支体内 await 至完成。
+/// The free-function form serves "split read/write + dedicated-task"
+/// assemblies — directly awaiting [`PacketChannel::recv`] inside a select
+/// loop is **not cancellation-safe** (framing is two read_exacts: a
+/// half-way future dropped ⇒ the already-consumed header/body bytes are
+/// lost and the frame stream desynchronizes permanently). The write side
+/// has no such issue: a full frame is awaited to completion inside the
+/// branch body.
 pub async fn send_packet<W>(w: &mut W, pkt: &[u8]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -161,10 +196,12 @@ where
     w.write_all(&frame).await
 }
 
-/// 收一个包帧（对端 FIN 且无残包 ⇒ `UnexpectedEof`）。
+/// Receive one packet frame (peer FIN with no partial packet ⇒
+/// `UnexpectedEof`).
 ///
-/// 取消安全注意：本函数内部仍是两次 read_exact——**只在专职读任务里循环使用**
-/// （任务不被 select 取消，半途状态安全保存在自身的执行栈上）。
+/// Cancellation-safety note: internally this is still two read_exacts —
+/// **loop it only inside a dedicated reader task** (the task is never
+/// cancelled by select; half-way state lives safely on its own stack).
 pub async fn recv_packet<R>(r: &mut R) -> io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
@@ -179,33 +216,39 @@ where
 }
 
 impl PacketChannel {
-    /// 装配（出站 `Tunnel::open_packet_channel` 与接受侧 `accept_stream` 配套共用；
-    /// ponytail：合并原 new/from_stream 双构造同体）。
+    /// Assembly constructor (shared by the outbound
+    /// `Tunnel::open_packet_channel` and the accepting side's
+    /// `accept_stream`; ponytail: merges the former new/from_stream dual
+    /// constructors into one).
     pub fn from_stream(stream: Stream) -> Self {
         PacketChannel { stream }
     }
 
-    /// 消费为底层流（chunked 注入等测试路径用）。
+    /// Consume into the underlying stream (for test paths like chunked
+    /// injection).
     pub fn into_stream(self) -> Stream {
         self.stream
     }
 
-    /// 发一个 IP 包：`[u16 len][pkt]`。
+    /// Send one IP packet: `[u16 len][pkt]`.
     pub async fn send(&mut self, pkt: &[u8]) -> io::Result<()> {
         send_packet(&mut self.stream, pkt).await
     }
 
-    /// 收一个 IP 包。对端 FIN 且无残包 ⇒ `UnexpectedEof`。
+    /// Receive one IP packet. Peer FIN with no partial packet ⇒
+    /// `UnexpectedEof`.
     pub async fn recv(&mut self) -> io::Result<Vec<u8>> {
         recv_packet(&mut self.stream).await
     }
 
-    /// 单向结束（透传 [`Stream::finish`] 的 yamux FIN 语义）。
+    /// Unidirectional finish (passes through [`Stream::finish`]'s yamux
+    /// FIN semantics).
     pub async fn finish(&mut self) -> io::Result<()> {
         self.stream.finish().await
     }
 
-    /// 消费为包迭代流（§3.6 `recv_stream()`）：逐包产出，错误/EOF 终止。
+    /// Consume into a packet-iterator stream (§3.6 `recv_stream()`):
+    /// yields packet by packet; error/EOF terminates.
     pub fn recv_stream(self) -> PacketRx {
         PacketRx {
             framer: FrameRx::new(self.stream),
@@ -213,12 +256,17 @@ impl PacketChannel {
     }
 }
 
-/// `[u16 LE len][pkt]` 帧化解码状态机（[`PacketRx`] 的内核）。
+/// `[u16 LE len][pkt]` framing decode state machine (the kernel of
+/// [`PacketRx`]).
 ///
-/// 帧化状态（2B 头 + 部分体缓冲）是**结构体字段**——跨 poll/跨唤醒保留。泛型化在
-/// 读取面 `R` 上，使「包体分多次唤醒到达」可用 mock 读取器直接做回归测试
-/// （[`PacketChannel::recv`]/[`recv_packet`] 的两次 read_exact 形态没有跨调用状态，
-/// 包体半途 future 被丢弃即帧流永久失步，见 `send_packet` 的取消安全注记）。
+/// The framing state (2B header + partial body buffer) lives in
+/// **struct fields** — preserved across polls/wakeups. The generic is on
+/// the reader surface `R`, so "packet body arriving across multiple
+/// wakeups" can be regression-tested directly with a mock reader
+/// ([`PacketChannel::recv`]/[`recv_packet`]'s two-read_exact form carries
+/// no cross-call state; dropping a half-way future permanently
+/// desynchronizes the frame stream — see the cancellation-safety note on
+/// `send_packet`).
 pub(crate) struct FrameRx<R> {
     r: R,
     hdr: [u8; 2],
@@ -244,10 +292,13 @@ impl<R: AsyncRead + Unpin> FStream for FrameRx<R> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        // 帧头：2B 增量填满（每次 poll_read 至多推进一段，Pending 即带着已收字节返回）。
+        // Frame header: fill incrementally in 2B (each poll_read advances
+        // at most one stretch; Pending returns while keeping the bytes
+        // already received).
         while this.hdr_filled < this.hdr.len() {
             match Pin::new(&mut this.r).poll_read(cx, &mut this.hdr[this.hdr_filled..]) {
-                // EOF ⇒ 沿 recv_packet 的 read_exact→UnexpectedEof→None 语义（含半帧截断）。
+                // EOF ⇒ follow recv_packet's read_exact→UnexpectedEof→None
+                // semantics (including half-frame truncation).
                 Poll::Ready(Ok(0)) => return Poll::Ready(None),
                 Poll::Ready(Ok(n)) => this.hdr_filled += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
@@ -273,10 +324,13 @@ impl<R: AsyncRead + Unpin> FStream for FrameRx<R> {
     }
 }
 
-/// [`PacketChannel::recv_stream`] 的产物：`futures::Stream<Item = io::Result<Vec<u8>>>`。
+/// The product of [`PacketChannel::recv_stream`]: a
+/// `futures::Stream<Item = io::Result<Vec<u8>>>`.
 ///
-/// 帧化状态保存在 [`FrameRx`] 字段内跨 poll 复用——包体分多次唤醒到达时不再把
-/// body 首 2 字节误读为新帧头（回归测试 `packet_rx_frames_survive_split_arrival`）。
+/// Framing state is kept in [`FrameRx`] fields across polls — when a
+/// packet body arrives across multiple wakeups, the body's first 2 bytes
+/// are no longer misread as a new frame header (regression test
+/// `packet_rx_frames_survive_split_arrival`).
 pub struct PacketRx {
     framer: FrameRx<Stream>,
 }
@@ -289,14 +343,18 @@ impl FStream for PacketRx {
     }
 }
 
-// —— 供 session 内部装配的 yamux 帧承载 IO（明文管道：记录层已加密/解密）——
+// —— Yamux frame-carrier IO for session-internal assembly (plaintext
+// pipes: the record layer has already encrypted/decrypted) ——
 
-/// 在途 data 通道发送 future（tokio mpsc 无 poll 式 reserve，故存自引用 future）。
+/// In-flight data-channel send future (tokio mpsc has no poll-style
+/// reserve, hence the stored self-referential future).
 type SendFut =
     Pin<Box<dyn Future<Output = Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>>> + Send>>;
 
-/// yamux 承载 IO：读端 = 读泵投递的已解密 DATA 记录；写端 = 待封装 payload 交写泵
-/// （封装在写泵唯一串行点执行，保证记录计数器顺序 = 实际上线顺序）。
+/// Yamux carrier IO: the read end = decrypted DATA records delivered by
+/// the read pump; the write end = payloads to be sealed, handed to the
+/// write pump (sealing happens at the write pump's single serialization
+/// point, guaranteeing record-counter order = actual wire order).
 pub(crate) struct MuxIo {
     pub(crate) plain_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     pub(crate) data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -306,7 +364,7 @@ pub(crate) struct MuxIo {
 }
 
 impl MuxIo {
-    /// 装配构造子（session::spawn_session 用）。
+    /// Assembly constructor (used by session::spawn_session).
     pub(crate) fn new(
         plain_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -333,7 +391,8 @@ impl AsyncRead for MuxIo {
         if self.rbuf.is_empty() {
             match ready!(self.plain_rx.poll_recv(cx)) {
                 Some(payload) => self.rbuf = payload,
-                None => return Poll::Ready(Ok(0)), // 会话关闭（对端 EOF/本侧 kill）
+                None => return Poll::Ready(Ok(0)), // session closed (peer
+                                                   // EOF / local kill)
             }
         }
         let n = buf.len().min(self.rbuf.len());
@@ -352,12 +411,14 @@ impl AsyncWrite for MuxIo {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        // 分片上限：单条记录 payload ≤ 1MiB（§1.3.3c 记录层不变量）；64KiB 保证
-        // 记录粒度细腻且不触碰上限。
+        // Chunk cap: a single record payload ≤ 1MiB (§1.3.3c record-layer
+        // invariant); 64KiB keeps record granularity fine without touching
+        // the cap.
         if self.send_fut.is_none() {
             let n = buf.len().min(64 * 1024);
             self.send_len = n;
-            // async move 块持有克隆的 Sender ⇒ future 'static（send 借用 &self）。
+            // The async move block holds a cloned Sender ⇒ the future is
+            // 'static (send borrows &self).
             let tx = self.data_tx.clone();
             let chunk = buf[..n].to_vec();
             self.send_fut = Some(Box::pin(async move { tx.send(chunk).await }));
@@ -369,9 +430,12 @@ impl AsyncWrite for MuxIo {
                 Poll::Ready(Ok(this.send_len))
             }
             Poll::Ready(Err(_)) => {
-                // 完成的 future 必须清出 send_fut：yamux 在写错误后会重试 poll_write，
-                // 复轮询已完成 future 会以「async fn resumed after completion」panic
-                //（实测杀掉 mux 驱动任务、扰乱会话拆除时序——A9 死链检测被拖延）。
+                // A completed future must be cleared out of send_fut:
+                // yamux retries poll_write after a write error, and
+                // re-polling a completed future panics with "async fn
+                // resumed after completion" (observed live when killing
+                // the mux driver task and disturbing the session teardown
+                // ordering — A9 dead-link detection was delayed).
                 this.send_fut = None;
                 Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -383,10 +447,13 @@ impl AsyncWrite for MuxIo {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(())) // 有界通道满即背压，flush 无独立语义
+        Poll::Ready(Ok(())) // a full bounded channel is the backpressure;
+                            // flush has no separate semantics
     }
 
-    /// 禁半关闭：对承载 IO 不做任何 shutdown（整链拆除由会话层统一负责）。
+    /// Half-close forbidden: no shutdown of any kind on the carrier IO
+    /// (whole-chain teardown is the session layer's unified
+    /// responsibility).
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
@@ -401,9 +468,12 @@ mod tests {
         assert_ne!(Prio::Control, Prio::Normal);
     }
 
-    /// 分片到达 mock（延迟投递）：每次 poll_read 弹出一个预置 chunk（块大于请求 buf 时
-    /// 保留剩余字节下次续读）；队列空 ⇒ Pending（noop waker 不会自动重唤，由测试手动
-    /// 再 poll——精确控制「跨唤醒到达」的字节切面）；`eof = true` 后返回 Ok(0) 模拟 FIN。
+    /// Trickle-arrival mock (deferred delivery): each poll_read pops one
+    /// preset chunk (when the chunk exceeds the requested buf, the
+    /// remainder is kept for the next read); an empty queue ⇒ Pending (a
+    /// noop waker does not auto-rewake; the test polls again manually —
+    /// precise control over the byte-slicing of "arrival across
+    /// wakeups"); after `eof = true`, returns Ok(0) to simulate FIN.
     struct TrickleReader {
         chunks: std::collections::VecDeque<Vec<u8>>,
         eof: bool,
@@ -431,10 +501,14 @@ mod tests {
         }
     }
 
-    /// 回归（评审确认缺陷）：旧 PacketRx 每次 poll 新建 `ch.recv()` future、Pending 即丢
-    /// ——包体跨唤醒到达时已消费的帧头/帧体状态丢失，body 首 2 字节被当新帧头，帧流
-    /// 永久失步。帧化状态上移 FrameRx 字段后：逐字节分片到达（每字节一次 poll、期间
-    /// 多次返回 Pending）必须完整分帧。
+    /// Regression (review-confirmed defect): the old PacketRx rebuilt a
+    /// `ch.recv()` future on every poll and dropped it on Pending — when a
+    /// packet body arrived across wakeups, the consumed header/body state
+    /// was lost, the body's first 2 bytes were treated as a new header,
+    /// and the frame stream desynchronized permanently. With the framing
+    /// state hoisted into FrameRx fields: byte-by-byte trickle arrival
+    /// (one poll per byte, returning Pending multiple times in between)
+    /// must frame completely.
     #[test]
     fn packet_rx_frames_survive_split_arrival() {
         use futures::task::noop_waker;
@@ -442,7 +516,7 @@ mod tests {
 
         let pkt1: Vec<u8> = (0..40u8).collect();
         let pkt2: Vec<u8> = vec![0xA5; 5];
-        let pkt3: Vec<u8> = Vec::new(); // 0 长度包（合法帧：len=0）
+        let pkt3: Vec<u8> = Vec::new(); // 0-length packet (legal frame: len=0)
         let mut wire: Vec<u8> = Vec::new();
         for p in [&pkt1, &pkt2, &pkt3] {
             wire.extend_from_slice(&(p.len() as u16).to_le_bytes());
@@ -459,28 +533,38 @@ mod tests {
 
         let mut got: Vec<Vec<u8>> = Vec::new();
         for &b in &wire {
-            // 每次只投递 1 字节再 poll：帧未齐 ⇒ Pending（旧实现的半途 future 在此被
-            // 丢弃、下一 poll 从 body 字节重建帧头）；帧齐 ⇒ Ready 收包。
+            // Deliver only 1 byte then poll: frame incomplete ⇒ Pending
+            // (the old implementation's half-way future was dropped here,
+            // and the next poll rebuilt a header from body bytes); frame
+            // complete ⇒ Ready with a packet.
             rx.r.chunks.push_back(vec![b]);
             loop {
                 match rx.poll_next_unpin(&mut cx) {
                     Poll::Pending => break,
                     Poll::Ready(Some(Ok(p))) => got.push(p),
-                    Poll::Ready(Some(Err(e))) => panic!("分片到达分帧错误: {e}"),
-                    Poll::Ready(None) => panic!("数据未尽即 EOF"),
+                    Poll::Ready(Some(Err(e))) => panic!("framing error on trickle arrival: {e}"),
+                    Poll::Ready(None) => panic!("EOF before all data arrived"),
                 }
             }
         }
-        assert_eq!(got, vec![pkt1, pkt2, pkt3], "分片到达逐包逐字节完整且有序");
+        assert_eq!(
+            got,
+            vec![pkt1, pkt2, pkt3],
+            "trickle arrival frames completely, packet by packet, byte by byte"
+        );
 
-        // 全部帧收完 ⇒ Pending（等更多数据）；FIN ⇒ None 收尾。
+        // All frames received ⇒ Pending (waiting for more data); FIN ⇒
+        // None as the finish.
         assert!(rx.poll_next_unpin(&mut cx).is_pending());
         rx.r.eof = true;
         assert!(matches!(rx.poll_next_unpin(&mut cx), Poll::Ready(None)));
     }
 
-    /// 分片到达回归的第二形态：帧头/帧体按「粗块」跨 poll 到达（帧头一块、帧体两半、
-    /// 下一帧紧随其后同块）——每块投递后 poll 至 Pending，半途状态跨 poll 保留。
+    /// Second shape of the trickle-arrival regression: header/body
+    /// arriving as coarse chunks across polls (header as one chunk, body
+    /// in two halves, the next frame immediately following in the same
+    /// chunk) — after each chunk delivery, poll until Pending; half-way
+    /// state survives across polls.
     #[test]
     fn packet_rx_frames_survive_chunked_body_arrival() {
         use futures::task::noop_waker;
@@ -509,9 +593,9 @@ mod tests {
 
         let mut got: Vec<Vec<u8>> = Vec::new();
         let chunks = vec![
-            frame1[..2].to_vec(),                     // 帧 1 头（体未到 ⇒ Pending）
-            frame1[2..52].to_vec(),                   // 帧 1 体前半（半途 ⇒ Pending）
-            [frame1[52..].to_vec(), frame2].concat(), // 帧 1 体后半 + 整帧 2 同块
+            frame1[..2].to_vec(),   // frame 1 header (body absent ⇒ Pending)
+            frame1[2..52].to_vec(), // frame 1 body first half (mid-way ⇒ Pending)
+            [frame1[52..].to_vec(), frame2].concat(), // frame 1 body second half + all of frame 2, same chunk
         ];
         for c in chunks {
             rx.r.chunks.push_back(c);
@@ -519,19 +603,26 @@ mod tests {
                 match rx.poll_next_unpin(&mut cx) {
                     Poll::Pending => break,
                     Poll::Ready(Some(Ok(p))) => got.push(p),
-                    Poll::Ready(Some(Err(e))) => panic!("分块到达分帧错误: {e}"),
-                    Poll::Ready(None) => panic!("数据未尽即 EOF"),
+                    Poll::Ready(Some(Err(e))) => panic!("framing error on chunked arrival: {e}"),
+                    Poll::Ready(None) => panic!("EOF before all data arrived"),
                 }
             }
         }
-        assert_eq!(got, vec![pkt1, pkt2], "块边界跨 poll 分帧完整");
+        assert_eq!(
+            got,
+            vec![pkt1, pkt2],
+            "chunk-boundary framing survives across polls"
+        );
         rx.r.eof = true;
         assert!(matches!(rx.poll_next_unpin(&mut cx), Poll::Ready(None)));
     }
 
-    /// 红形态对照（证明上述回归测试有牙）：与修复前 PacketRx 同构的实现——每次
-    /// poll 新建「两次 read_exact」的 recv future、Pending 即丢。同一分片到达输入下
-    /// 必然失步：帧头读半 ⇒ 丢弃，下一 poll 把 body 首字节当新帧头重组出错误帧。
+    /// Red-shape control (proving the regression tests above have teeth):
+    /// an implementation isomorphic to the pre-fix PacketRx — rebuilding a
+    /// "two read_exact" recv future on every poll, dropped on Pending.
+    /// Under the same trickle-arrival input it must desynchronize: a
+    /// half-read header is dropped, and the next poll reassembles a wrong
+    /// frame out of the body's first bytes as a header.
     struct OldFrameRx<R> {
         r: R,
     }
@@ -585,24 +676,29 @@ mod tests {
                 match old.poll_next_unpin(&mut cx) {
                     Poll::Pending => break,
                     Poll::Ready(Some(Ok(p))) => got.push(p),
-                    Poll::Ready(Some(Err(e))) => panic!("红形态对照不应报错: {e}"),
-                    Poll::Ready(None) => panic!("数据未尽即 EOF"),
+                    Poll::Ready(Some(Err(e))) => panic!("red-shape control should not error: {e}"),
+                    Poll::Ready(None) => panic!("EOF before all data arrived"),
                 }
             }
         }
-        // 失步实锤：同一输入下，旧形态产不出与线上一致的包序列（帧头半途被丢 ⇒
-        // 后续字节被重组成错误长度的帧）。
+        // Desynchronization confirmed: under the same input, the old shape
+        // cannot produce the packet sequence matching the wire (a half-way
+        // header is dropped ⇒ subsequent bytes get reassembled into
+        // wrong-length frames).
         assert_ne!(
             got,
             vec![pkt.clone()],
-            "旧形态若能正确分帧，则缺陷不存在——此断言失败说明输入未覆盖分片路径"
+            "if the old shape framed correctly, the defect would not exist — this assertion failing means the input does not cover the trickle path"
         );
     }
 
-    /// 回归（A9 排障实测）：写泵消失（会话拆除 ⇒ data_rx drop）后 send 立即 Err；
-    /// yamux 在写错误后会重试 poll_write——已完成 future 必须已清出 `send_fut`，
-    /// 否则复轮询以「async fn resumed after completion」panic（杀 mux 驱动任务，
-    /// 拖延死链拆除时序）。
+    /// Regression (observed live during A9 troubleshooting): after the
+    /// write pump is gone (session teardown ⇒ data_rx dropped), send
+    /// errors immediately; yamux retries poll_write after a write error —
+    /// the completed future must already be cleared out of `send_fut`,
+    /// otherwise re-polling panics with "async fn resumed after
+    /// completion" (killing the mux driver task and delaying dead-link
+    /// teardown).
     #[test]
     fn muxio_write_err_then_repoll_returns_err_without_panic() {
         use futures::task::noop_waker;
@@ -610,7 +706,7 @@ mod tests {
 
         let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let (_plain_hold, plain_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        drop(data_rx); // 写泵消失（通道无接收者 ⇒ send 立即 Err）
+        drop(data_rx); // write pump gone (no receiver on the channel ⇒ send errors immediately)
 
         let mut io = MuxIo::new(plain_rx, data_tx);
         let waker = noop_waker();
@@ -618,13 +714,14 @@ mod tests {
         let first = std::pin::Pin::new(&mut io).poll_write(&mut cx, b"payload");
         match first {
             Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
-            other => panic!("期望 Ready(Err(BrokenPipe))，得 {other:?}"),
+            other => panic!("expected Ready(Err(BrokenPipe)), got {other:?}"),
         }
-        // 复轮询（yamux 写重试形态）：不得 panic，且再次给出 BrokenPipe。
+        // Re-poll (the yamux write-retry shape): must not panic and must
+        // yield BrokenPipe again.
         let second = std::pin::Pin::new(&mut io).poll_write(&mut cx, b"payload");
         match second {
             Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
-            other => panic!("复轮询期望 Ready(Err(BrokenPipe))，得 {other:?}"),
+            other => panic!("re-poll expected Ready(Err(BrokenPipe)), got {other:?}"),
         }
     }
 }

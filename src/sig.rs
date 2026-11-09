@@ -1,15 +1,22 @@
-//! SR-SIG1 请求签名 + 密钥档案（docs/design.md §1.3.2 兼容面 / §1.3.3g / §3.3，P2-12）。
+//! SR-SIG1 request signing + key profiles (docs/design.md §1.3.2
+//! compatibility surface / §1.3.3g / §3.3, P2-12).
 //!
-//! 兼容契约（showroom-common lib.rs:222-340 逐字节不变，§1.3.2）：
-//! - canonical 七字段：`SR-SIG1\n<user>\n<ts>\n<nonce>\n<METHOD>\n<path_with_query>\n<sha256_hex(body)>`；
-//! - 线上格式：`SR-SIG1 <user>:<ts>:<nonce>:<sig_b64url>`（sig 为 base64url 无 padding）；
-//! - [`SIG_WINDOW_SECS`] = 300（showroom-common lib.rs:48 原值）。
+//! Compatibility contract (showroom-common lib.rs:222-340, byte-for-byte
+//! unchanged, §1.3.2):
+//! - canonical seven fields: `SR-SIG1\n<user>\n<ts>\n<nonce>\n<METHOD>\n<path_with_query>\n<sha256_hex(body)>`;
+//! - wire format: `SR-SIG1 <user>:<ts>:<nonce>:<sig_b64url>` (sig is
+//!   base64url without padding);
+//! - [`SIG_WINDOW_SECS`] = 300 (showroom-common lib.rs:48 original value).
 //!
-//! 本模块与 showroom 3.0 生态的 Ed25519 签名逐字节互通（RFC 8032 确定性签名），
-//! 依赖代际升级 ed25519-dalek 2.2 → 3.0（§1.3.2，P1-6）。
+//! This module interoperates byte-for-byte with the showroom 3.0
+//! ecosystem's Ed25519 signatures (RFC 8032 deterministic signing); the
+//! dependency generation is upgraded ed25519-dalek 2.2 → 3.0 (§1.3.2,
+//! P1-6).
 //!
-//! 升级档位（§1.3.3g）：[`KeyProfile`] 按 kid 分派验签算法——Ed25519 主档 +
-//! `pq-sign` feature 下的 ML-DSA-65 槽位（占位，ml-dsa 0.1.1 未审计，crypto-2026 §5）。
+//! Upgrade tier (§1.3.3g): [`KeyProfile`] dispatches the verification
+//! algorithm by kid — Ed25519 as the primary tier plus an ML-DSA-65 slot
+//! under the `pq-sign` feature (placeholder; ml-dsa 0.1.1 is unaudited,
+//! crypto-2026 §5).
 
 use core::fmt;
 
@@ -21,16 +28,18 @@ use sha2::{Digest, Sha256};
 
 use crate::KEY_LEN;
 
-/// SR-SIG1 时间戳容差：|now − ts| ≤ 300s（§1.3.2，showroom-common lib.rs:48 原值保留）。
+/// SR-SIG1 timestamp tolerance: |now − ts| ≤ 300s (§1.3.2, showroom-common
+/// lib.rs:48 original value preserved).
 pub const SIG_WINDOW_SECS: i64 = 300;
 
-/// `sha256_hex`：32B 摘要 → 64 小写 hex。
+/// `sha256_hex`: 32B digest → 64 lowercase hex chars.
 pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
-/// 流式 sha256（64KiB 缓冲）：大文件先哈希再签名（`sign_prehashed`），
-/// 避免整文件进内存（showroom-common lib.rs:62-72 同语义）。
+/// Streaming sha256 (64KiB buffer): hash large files first, then sign
+/// (`sign_prehashed`), avoiding loading whole files into memory (same
+/// semantics as showroom-common lib.rs:62-72).
 pub fn sha256_hex_stream(mut r: impl std::io::Read) -> std::io::Result<String> {
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -43,38 +52,43 @@ pub fn sha256_hex_stream(mut r: impl std::io::Read) -> std::io::Result<String> {
     }
 }
 
-/// SR-SIG1 nonce：16 随机字节 → 32 hex（P2-13：以实现为准 16B/32hex）。
+/// SR-SIG1 nonce: 16 random bytes → 32 hex chars (P2-13: the
+/// implementation is authoritative — 16B/32hex).
 pub fn nonce_hex() -> String {
     let mut b = [0u8; 16];
-    rand::rng().fill_bytes(&mut b); // rand 0.9 ThreadRng（不可失败 RngCore）
+    rand::rng().fill_bytes(&mut b); // rand 0.9 ThreadRng (infallible RngCore)
     hex::encode(b)
 }
 
-// ———— SR-SIG1 五函数（§1.3.2 兼容面，签名不变）————
+// ———— SR-SIG1 five functions (§1.3.2 compatibility surface, signatures
+// unchanged) ————
 
-/// Ed25519 用户签名密钥（showroom `UserKey` 对应物）。
+/// Ed25519 user signing key (counterpart of showroom `UserKey`).
 pub struct UserKey(SigningKey);
 
 impl UserKey {
-    /// 随机生成（rand 0.9 ThreadRng 种子）。
+    /// Generate randomly (seeded from rand 0.9 ThreadRng).
     pub fn generate() -> Self {
         let mut seed = [0u8; KEY_LEN];
         rand::rng().fill_bytes(&mut seed);
         UserKey(SigningKey::from_bytes(&seed))
     }
 
-    /// 由裸 32B seed 构造（showroom `id_ed25519` 文件格式；文件读写由调用方负责，
-    /// 0600 落盘工具属原生平台层，后续批次随兼容面补齐）。
+    /// Construct from a raw 32B seed (the showroom `id_ed25519` file
+    /// format; file I/O is the caller's responsibility — the 0600
+    /// persistence utility belongs to the native platform layer and joins
+    /// the compatibility surface in a later batch).
     pub fn from_seed(seed: &[u8; KEY_LEN]) -> Self {
         UserKey(SigningKey::from_bytes(seed))
     }
 
-    /// 裸 32B seed。
+    /// Raw 32B seed.
     pub fn to_seed(&self) -> [u8; KEY_LEN] {
         self.0.to_bytes()
     }
 
-    /// 读取裸 32B seed 文件（[`UserKey::save_seed`] 写出的格式；showroom `id_ed25519`）。
+    /// Read a raw 32B seed file (the format written by
+    /// [`UserKey::save_seed`]; showroom `id_ed25519`).
     pub fn from_seed_file(path: &std::path::Path) -> crate::compat::Result<Self> {
         let seed = std::fs::read(path)?;
         let seed: [u8; KEY_LEN] = seed.as_slice().try_into().map_err(|_| {
@@ -86,14 +100,16 @@ impl UserKey {
         Ok(UserKey(SigningKey::from_bytes(&seed)))
     }
 
-    /// 写裸 32B seed（0600；unix 平台专属——wasm32 无文件系统语义）。
+    /// Write the raw 32B seed (0600; unix-only — wasm32 has no filesystem
+    /// semantics).
     #[cfg(unix)]
     pub fn save_seed(&self, path: &std::path::Path) -> crate::compat::Result<()> {
         crate::compat::write_private(path, &self.0.to_bytes())?;
         Ok(())
     }
 
-    /// `"ed25519:<base64(pubkey)>"`（base64 无 padding；showroom 逐字节同格式）。
+    /// `"ed25519:<base64(pubkey)>"` (base64 without padding; byte-for-byte
+    /// the showroom format).
     pub fn pub_string(&self) -> String {
         format!(
             "ed25519:{}",
@@ -101,9 +117,10 @@ impl UserKey {
         )
     }
 
-    /// 解析 `"ed25519:<base64(pubkey)>"`（showroom 同格式）。
-    /// 错误类型 = `Box<dyn Error>`（§1.3.2 兼容面签名不变：showroom 原返回
-    /// `Result<VerifyingKey>` 即 `Result<_, Box<dyn Error>>`）。
+    /// Parse `"ed25519:<base64(pubkey)>"` (same format as showroom). Error
+    /// type = `Box<dyn Error>` (§1.3.2 compatibility surface signature
+    /// unchanged: showroom originally returned `Result<VerifyingKey>`,
+    /// i.e. `Result<_, Box<dyn Error>>`).
     pub fn from_pub_string(s: &str) -> crate::compat::Result<VerifyingKey> {
         let raw = STANDARD_NO_PAD.decode(
             s.strip_prefix("ed25519:")
@@ -119,12 +136,13 @@ impl UserKey {
 
 impl fmt::Debug for UserKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("UserKey(ed25519:…)") // 不泄露密钥材料
+        f.write_str("UserKey(ed25519:…)") // do not leak key material
     }
 }
 
-/// canonical 七字段：`SR-SIG1\n<user>\n<ts>\n<nonce>\n<METHOD>\n<path_with_query>\n<sha256_hex(body)>`
-/// （showroom-common lib.rs:222-231 逐字节不变）。
+/// Canonical seven fields:
+/// `SR-SIG1\n<user>\n<ts>\n<nonce>\n<METHOD>\n<path_with_query>\n<sha256_hex(body)>`
+/// (showroom-common lib.rs:222-231, byte-for-byte unchanged).
 #[allow(clippy::too_many_arguments)]
 pub fn build_canonical(
     user: &str,
@@ -137,8 +155,10 @@ pub fn build_canonical(
     format!("SR-SIG1\n{user}\n{ts}\n{nonce}\n{method}\n{path_with_query}\n{body_sha256_hex}")
 }
 
-/// 生成完整 Authorization 值 `SR-SIG1 <user>:<ts>:<nonce>:<sig_b64url>`
-/// （sig 为 base64url 无 padding；nonce 由调用方生成——`nonce_hex`；method 传大写）。
+/// Produce the complete Authorization value `SR-SIG1
+/// <user>:<ts>:<nonce>:<sig_b64url>` (sig is base64url without padding;
+/// the nonce is generated by the caller — `nonce_hex`; pass method
+/// uppercase).
 pub fn sign(
     user: &str,
     key: &UserKey,
@@ -159,8 +179,10 @@ pub fn sign(
     )
 }
 
-/// 预哈希签名：body 哈希由调用方算好（`sha256_hex` / `sha256_hex_stream`），与 [`sign`] 同格式
-/// ——大文件流式上传先哈希再签，避免整文件进内存。
+/// Pre-hashed signing: the body hash is already computed by the caller
+/// (`sha256_hex` / `sha256_hex_stream`); same format as [`sign`] — hash
+/// large streaming uploads first, then sign, avoiding loading whole files
+/// into memory.
 pub fn sign_prehashed(
     user: &str,
     key: &UserKey,
@@ -178,8 +200,9 @@ pub fn sign_prehashed(
     )
 }
 
-/// 验签成功产物：命中身份与时间戳/nonce（nonce 查重由调用方按 `Verified.nonce` 自行完成，
-/// §1.3.2「刻意留给调用方」边界）。
+/// Successful verification result: the matched identity plus
+/// timestamp/nonce (nonce deduplication is done by the caller using
+/// `Verified.nonce`; §1.3.2 "deliberately left to the caller" boundary).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verified {
     pub user: String,
@@ -187,7 +210,8 @@ pub struct Verified {
     pub nonce: String,
 }
 
-/// SR-SIG1 验签错误（showroom 三态原样保留：Format/Stale/BadSignature）。
+/// SR-SIG1 verification error (showroom's three states preserved verbatim:
+/// Format/Stale/BadSignature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthError {
     Format,
@@ -207,7 +231,9 @@ impl fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-/// 验证 SR-SIG1：格式解析 → ±300s 时间窗 → 依次尝试登记公钥（user 可多把，任一命中即过）。
+/// Verify SR-SIG1: format parsing → ±300s time window → try each
+/// registered public key in turn (a user may have several; any hit
+/// passes).
 pub fn verify(
     auth_value: &str,
     pubkeys: &[VerifyingKey],
@@ -226,8 +252,10 @@ pub fn verify(
     )
 }
 
-/// 预计算哈希版验签：与 [`verify`] 完全同语义（格式 → ±300s → 任一登记公钥命中），
-/// body 只认 `sha256_hex`——import 等只落盘+哈希、不留 body 本体的调用方复用。
+/// Pre-computed-hash verification: exactly the same semantics as
+/// [`verify`] (format → ±300s → any registered key hits); accepts only
+/// `sha256_hex` for the body — for callers like import that only persist +
+/// hash and never keep the body itself.
 pub fn verify_with_hash(
     auth_value: &str,
     pubkeys: &[VerifyingKey],
@@ -270,27 +298,32 @@ pub fn verify_with_hash(
     Err(AuthError::BadSignature)
 }
 
-// ———— KeyProfile：kid → 算法分派（§1.3.3g / §3.3，P2-12）————
+// ———— KeyProfile: kid → algorithm dispatch (§1.3.3g / §3.3, P2-12) ————
 
-/// kid 派生：`sha256(ed25519 公钥 32B)` 前 8 hex（showroomctl state.rs:695-697 同源约定，
-/// 与 `tokens/<user>/<kid>.pub` 文件名一致）。
+/// kid derivation: first 8 hex chars of `sha256(ed25519 public key 32B)`
+/// (same-origin convention as showroomctl state.rs:695-697, matching the
+/// `tokens/<user>/<kid>.pub` filename).
 pub fn kid_of(vk: &VerifyingKey) -> String {
     sha256_hex(&vk.to_bytes())[..8].to_string()
 }
 
-/// 单把档案钥匙：算法分派槽位。扩展新算法 = 加变体，调用方零改动（§3.3 接缝）。
+/// A single profile key: an algorithm dispatch slot. Extending to a new
+/// algorithm = adding a variant, zero caller changes (§3.3 seam).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProfileKey {
-    /// Ed25519 主档（ed25519-dalek 3.0.0）。
+    /// Ed25519 primary tier (ed25519-dalek 3.0.0).
     Ed25519(VerifyingKey),
-    /// 占位（未实现）：ML-DSA-65 并行公钥档。`pq-sign` feature 专属；ml-dsa 0.1.1
-    /// 未审计（crypto-2026 §5），本批次仅预留槽位，接入时填充真实验签。
+    /// Placeholder (unimplemented): the ML-DSA-65 parallel public-key
+    /// tier. Exclusive to the `pq-sign` feature; ml-dsa 0.1.1 is unaudited
+    /// (crypto-2026 §5), so this batch only reserves the slot — fill in
+    /// real verification when wiring it up.
     #[cfg(feature = "pq-sign")]
     MlDsa65Placeholder,
 }
 
 impl ProfileKey {
-    /// 用该钥匙验签（原语层：消息+签名，不含 SR-SIG1 头解析）。
+    /// Verify with this key (primitive layer: message + signature, no
+    /// SR-SIG1 header parsing).
     fn verify_raw(&self, msg: &[u8], sig: &[u8]) -> Result<(), DispatchError> {
         match self {
             ProfileKey::Ed25519(vk) => {
@@ -304,12 +337,14 @@ impl ProfileKey {
     }
 }
 
-/// kid 分派失败三态：kid 未登记 / 验签失败 / 算法档未实现（占位槽位）。
+/// kid dispatch failure, three states: kid not registered / verification
+/// failed / algorithm tier unimplemented (placeholder slot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchError {
     UnknownKid,
     BadSignature,
-    /// 占位算法档（如 `pq-sign` 未接入的 ML-DSA-65）。
+    /// Placeholder algorithm tier (e.g. ML-DSA-65 not yet wired under
+    /// `pq-sign`).
     UnsupportedAlgorithm,
 }
 
@@ -327,22 +362,26 @@ impl fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
-/// 密钥档案：kid → [`ProfileKey`] 分派表（Ed25519 主档；`pq-sign` 下 ML-DSA-65 位）。
+/// Key profile: kid → [`ProfileKey`] dispatch table (Ed25519 primary tier;
+/// the ML-DSA-65 slot under `pq-sign`).
 ///
-/// 调用方约定（§1.3.2）：按 user 名下全部公钥任一命中即过——那是 [`verify`] 的语义；
-/// `KeyProfile` 用于 kid 已知（如 `tokens/<user>/<kid>.pub` 定位）的单把复验路径。
+/// Caller convention (§1.3.2): any hit among all of a user's public keys
+/// passes — that is [`verify`]'s semantics; `KeyProfile` serves the
+/// single-key re-verification path where the kid is already known (e.g.
+/// located via `tokens/<user>/<kid>.pub`).
 #[derive(Debug, Clone, Default)]
 pub struct KeyProfile {
     keys: Vec<(String, ProfileKey)>,
 }
 
 impl KeyProfile {
-    /// 空档案。
+    /// An empty profile.
     pub fn new() -> Self {
         KeyProfile { keys: Vec::new() }
     }
 
-    /// 登记一把 Ed25519 公钥，返回其 kid（幂等：同钥重复登记不重复占位）。
+    /// Register an Ed25519 public key and return its kid (idempotent:
+    /// re-registering the same key does not duplicate the slot).
     pub fn insert_ed25519(&mut self, vk: VerifyingKey) -> String {
         let kid = kid_of(&vk);
         if !self.keys.iter().any(|(k, _)| *k == kid) {
@@ -351,18 +390,19 @@ impl KeyProfile {
         kid
     }
 
-    /// 按 kid 取钥匙。
+    /// Look up a key by kid.
     pub fn get(&self, kid: &str) -> Option<&ProfileKey> {
         self.keys.iter().find(|(k, _)| k == kid).map(|(_, v)| v)
     }
 
-    /// kid 分派验签：按 kid 定位钥匙 → 按算法档验签（raw 消息/签名，非 SR-SIG1 头）。
+    /// kid-dispatched verification: locate the key by kid → verify per its
+    /// algorithm tier (raw message/signature, not an SR-SIG1 header).
     pub fn verify_dispatch(&self, kid: &str, msg: &[u8], sig: &[u8]) -> Result<(), DispatchError> {
         let key = self.get(kid).ok_or(DispatchError::UnknownKid)?;
         key.verify_raw(msg, sig)
     }
 
-    /// 全部 kid（登记序）。
+    /// All kids (in registration order).
     pub fn kids(&self) -> impl Iterator<Item = &str> {
         self.keys.iter().map(|(k, _)| k.as_str())
     }
@@ -372,7 +412,7 @@ impl KeyProfile {
 mod tests {
     use super::*;
 
-    // 1. sign→verify 往返（body 非空 / 空）
+    // 1. sign→verify round trip (non-empty body / empty)
     #[test]
     fn sign_verify_roundtrip() {
         let k = UserKey::generate();
@@ -395,7 +435,7 @@ mod tests {
         }
     }
 
-    // 2. 篡改 body 一个字节 → BadSignature
+    // 2. Tamper one body byte → BadSignature
     #[test]
     fn tampered_body_rejected() {
         let k = UserKey::generate();
@@ -421,7 +461,7 @@ mod tests {
         );
     }
 
-    // 3. ts 超窗（now±301）→ Stale；±300 边界通过
+    // 3. ts outside the window (now±301) → Stale; ±300 boundary passes
     #[test]
     fn stale_ts_rejected() {
         let k = UserKey::generate();
@@ -446,7 +486,8 @@ mod tests {
         }
     }
 
-    // 4. 错误公钥 → BadSignature；多把公钥时第二把命中可通过
+    // 4. Wrong public key → BadSignature; with multiple keys, a hit on the
+    // second passes
     #[test]
     fn wrong_key_and_multi_key() {
         let k = UserKey::generate();
@@ -482,7 +523,8 @@ mod tests {
         .unwrap();
     }
 
-    // 5. 预哈希签名 / 流式哈希：与 sign/verify 同语义往返 + 已知 sha256 向量
+    // 5. Pre-hashed signing / streaming hash: same-semantics round trip
+    // with sign/verify + a known sha256 vector
     #[test]
     fn prehashed_sign_verify_and_stream_hash() {
         let hash = sha256_hex_stream(std::io::Cursor::new(b"stream-me")).unwrap();
@@ -506,7 +548,8 @@ mod tests {
         );
     }
 
-    // 6. canonical 七字段与线上格式的逐字节形状（§1.3.2 兼容契约）
+    // 6. Exact byte shape of the canonical seven fields and the wire
+    // format (§1.3.2 compatibility contract)
     #[test]
     fn canonical_and_wire_format_exact() {
         let c = build_canonical("alice", 42, "deadbeef", "GET", "/x?y=1", &sha256_hex(b"z"));
@@ -529,14 +572,18 @@ mod tests {
         );
         assert!(auth.starts_with("SR-SIG1 alice:42:deadbeef:"));
         let sig_b64 = auth.rsplit(':').next().unwrap();
-        assert_eq!(sig_b64.len(), 86, "64B 签名 base64url 无 padding = 86 字符");
+        assert_eq!(
+            sig_b64.len(),
+            86,
+            "64B signature base64url unpadded = 86 chars"
+        );
         assert!(
             !sig_b64.contains(['+', '/', '=']),
-            "base64url 无 padding 字符集"
+            "base64url unpadded charset"
         );
     }
 
-    // 7. UserKey seed / pub_string 往返
+    // 7. UserKey seed / pub_string round trip
     #[test]
     fn user_key_seed_and_pub_string() {
         let k = UserKey::from_seed(&[9u8; 32]);
@@ -547,7 +594,8 @@ mod tests {
         assert!(UserKey::from_pub_string("ed25519:AAAA").is_err());
     }
 
-    // 8. kid 派生：sha256(pub)[..8]，确定性、异钥相异
+    // 8. kid derivation: sha256(pub)[..8], deterministic, distinct across
+    // keys
     #[test]
     fn kid_derivation() {
         let k = UserKey::generate();
@@ -559,7 +607,8 @@ mod tests {
         assert_ne!(kid, kid_of(&UserKey::generate().0.verifying_key()));
     }
 
-    // 9. KeyProfile：登记→分派验签；未知 kid 拒；异 kid 钥匙拒
+    // 9. KeyProfile: register → dispatch-verify; unknown kid rejected;
+    // another key's kid rejected
     #[test]
     fn key_profile_dispatch() {
         let k = UserKey::generate();
@@ -573,38 +622,46 @@ mod tests {
             Some(ProfileKey::Ed25519(k.0.verifying_key()))
         );
         p.verify_dispatch(&kid, msg, &sig)
-            .expect("登记钥匙验签通过");
+            .expect("registered key verifies");
         assert_eq!(
             p.verify_dispatch("00000000", msg, &sig),
             Err(DispatchError::UnknownKid)
         );
 
-        // 异 kid：另一把钥匙的签名在原 kid 下必须失败
+        // Different kid: another key's signature must fail under the
+        // original kid
         let k2 = UserKey::generate();
         let sig2 = k2.0.sign(msg).to_bytes();
         assert_eq!(
             p.verify_dispatch(&kid, msg, &sig2),
             Err(DispatchError::BadSignature)
         );
-        // 签名长度错 → BadSignature
+        // Wrong signature length → BadSignature
         assert_eq!(
             p.verify_dispatch(&kid, msg, b"short"),
             Err(DispatchError::BadSignature)
         );
 
-        // 登记第二把：kids 幂等
+        // Register a second key: kids stay idempotent
         let kid2 = p.insert_ed25519(k2.0.verifying_key());
         assert_ne!(kid, kid2);
         p.verify_dispatch(&kid2, msg, &sig2)
-            .expect("第二把钥匙按自己的 kid 通过");
+            .expect("second key passes under its own kid");
         p.insert_ed25519(k2.0.verifying_key());
-        assert_eq!(p.kids().count(), 2, "同钥重复登记不重复占位");
+        assert_eq!(
+            p.kids().count(),
+            2,
+            "re-registering the same key does not duplicate the slot"
+        );
     }
 
-    // 10. 跨生态固定向量（showroom-common ed25519-dalek 2.2 生成，RFC 8032 确定性签名
-    //     ⇒ 本 crate 3.0 下必须逐字节复现）：tests/sig_showroom_vector.rs 集成测试覆盖。
+    // 10. Cross-ecosystem fixed vectors (generated with showroom-common
+    //     ed25519-dalek 2.2; RFC 8032 deterministic signing ⇒ must
+    //     reproduce byte-for-byte under this crate's 3.0): covered by the
+    //     tests/sig_showroom_vector.rs integration test.
 
-    // 11. seed 文件 save/from 往返 + 0600（unix 文件接缝；showroom lib.rs:607-619 平移）
+    // 11. Seed file save/from round trip + 0600 (unix file seam; ported
+    // from showroom lib.rs:607-619)
     #[cfg(unix)]
     #[test]
     fn user_key_seed_file_roundtrip() {
@@ -623,7 +680,7 @@ mod tests {
         let k2 = UserKey::from_seed_file(&p).unwrap();
         assert_eq!(k2.to_seed(), k.to_seed());
         assert_eq!(k2.pub_string(), k.pub_string());
-        // 非 32B seed 文件 → Err
+        // Non-32B seed file → Err
         std::fs::write(&p, b"short").unwrap();
         assert!(UserKey::from_seed_file(&p).is_err());
         let _ = std::fs::remove_dir_all(&dir);

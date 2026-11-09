@@ -1,10 +1,15 @@
-//! trust 集成测试（docs/design.md §7-M1 完成标准，P0-5 守门用例）。
+//! trust integration tests (docs/design.md §7-M1 completion criteria,
+//! P0-5 gate cases).
 //!
-//! - 邀请文件 v3 → **同一根下多端点 ServerEntry 各自完成 1-RTT 封装**（多服务器钉扎模型
-//!   §1.3.3f 的守门用例）：逐端点 session::initiate + respond，proxy 断言客户端首帧
-//!   必为 I1（0x03）——I0 不出现；
-//! - load_invite/save_invite 文件路径：往返 + 根签名不匹配拒载入 + v2 拒收；
-//! - TOFU → PinStore 落地闭环（trust::confirm_tofu_and_pin：首钉 + 二连钉扎比对）。
+//! - Invite file v3 → **each of multiple endpoints' ServerEntry under
+//!   the same root completes its own 1-RTT encapsulation** (the gate
+//!   case of the multi-server pinning model §1.3.3f): session::initiate
+//!   and respond per endpoint, with the proxy asserting the client's
+//!   first frame is always I1 (0x03) — I0 never appears;
+//! - load_invite/save_invite file paths: round trip + root-signature
+//!   mismatch rejected at load + v2 rejected;
+//! - TOFU → PinStore landing closed loop (trust::confirm_tofu_and_pin:
+//!   first pin + second-connect pin comparison).
 
 use std::time::Duration;
 
@@ -25,7 +30,8 @@ fn duplex_pair() -> (DuplexStream, DuplexStream) {
     tokio::io::duplex(256 * 1024)
 }
 
-/// 首帧窥探代理：记录客户端首个线上帧类型后双向透明转发。
+/// First-frame probe proxy: records the client's first wire frame type,
+/// then forwards transparently in both directions.
 async fn first_frame_probe(
     client_side: DuplexStream,
     server_side: DuplexStream,
@@ -34,7 +40,8 @@ async fn first_frame_probe(
     let (mut s_rd, mut s_wr) = tokio::io::split(server_side);
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        // c→s：读首帧记录类型并转发，随后透明
+        // c→s: read the first frame's record type and forward it, then
+        // become transparent
         let mut hdr = [0u8; 5];
         if c_rd.read_exact(&mut hdr).await.is_ok() {
             let len = u32::from_le_bytes(hdr[..4].try_into().expect("4B")) as usize;
@@ -82,7 +89,8 @@ fn cluster_of(n: usize) -> Cluster {
     }
 }
 
-/// 单端点 1-RTT 对拨：pin 来自目录条目；断言首帧 == I1 且数据回显可用。
+/// Single-endpoint 1-RTT dial: the pin comes from the directory entry;
+/// asserts the first frame == I1 and that the data plane echoes.
 async fn endpoint_1rtt(
     cluster: &Cluster,
     idx: usize,
@@ -140,14 +148,18 @@ async fn endpoint_1rtt(
     let client = cli.await.expect("cli task");
     let server_tunnel = srv.await.expect("srv task");
 
-    // 守门断言 1：客户端首帧必为 I1（已钉扎形态；I0 不出现）
+    // Gate assertion 1: the client's first frame must be I1 (pinned form;
+    // I0 never appears)
     let first = tokio::time::timeout(Duration::from_secs(5), probe)
         .await
         .expect("probe timeout")
         .expect("probe dropped");
-    assert_eq!(first, RT_I1, "端点 {idx}：任意端点均 1-RTT，I0 不得出现");
+    assert_eq!(
+        first, RT_I1,
+        "endpoint {idx}: every endpoint is 1-RTT; I0 must not appear"
+    );
 
-    // 守门断言 2：握手后数据面可用
+    // Gate assertion 2: the data plane works after the handshake
     let mut cs = client
         .open_stream(flock_protocol::mux::Prio::Normal)
         .await
@@ -171,7 +183,7 @@ async fn invite_multi_endpoint_all_1rtt() {
     let cluster = cluster_of(3);
     let device = DeviceStaticKeys::generate();
 
-    // 邀请文件 v3 落盘/读回
+    // Invite file v3 persisted/read back
     let now = flock_protocol::trust::now_unix();
     let invite = InviteFile::issue(
         &cluster.root,
@@ -188,10 +200,11 @@ async fn invite_multi_endpoint_all_1rtt() {
     assert_eq!(loaded.directory.servers.len(), 3);
     assert!(
         loaded.verify_against(&cluster.root.verifying_key()),
-        "对照签发根验签"
+        "verified against the issuing root"
     );
 
-    // 同一根下每个端点：从**目录条目**构造 pin，各自完成 1-RTT
+    // Every endpoint under the same root: build the pin from the
+    // **directory entry** and complete 1-RTT each
     for i in 0..3 {
         let client = endpoint_1rtt(&cluster, i, &device).await;
         client.shutdown().await;
@@ -211,22 +224,24 @@ async fn invite_file_rejects_tampered_and_old_versions() {
     );
     let bytes = invite.to_bytes();
 
-    // 条目被篡改：按内容定位第一 entry 的 relay_endpoint 串，翻转其中一个字节
-    // （仍是合法 UTF-8/合法结构）⇒ 结构解析可过而根验签必拒。
+    // Entry tampered: locate the first entry's relay_endpoint string by
+    // content and flip one of its bytes (still valid UTF-8/valid
+    // structure) ⇒ structural parsing passes but the root verification
+    // necessarily rejects.
     let ep = cluster.directory.servers[0].relay_endpoint.as_bytes();
     let pos = bytes
         .windows(ep.len())
         .position(|w| w == ep)
-        .expect("端点串必在邀请字节中");
+        .expect("the endpoint string must be in the invite bytes");
     let mut tampered = bytes.clone();
     tampered[pos] = if tampered[pos] == b'r' { b'R' } else { b'r' };
     let path = std::env::temp_dir().join(format!("flock-invite-bad-{}.bin", rand::random::<u64>()));
     std::fs::write(&path, &tampered).expect("write tampered");
-    let err = load_invite(&path).expect_err("条目被篡改 ⇒ 拒载入");
+    let err = load_invite(&path).expect_err("entry tampered ⇒ load rejected");
     let _ = std::fs::remove_file(&path);
     assert!(matches!(err, TrustError::BadSignature), "got {err:?}");
 
-    // v2 版本字节 ⇒ 拒收（v1/v2 不再接受）
+    // v2 version byte ⇒ rejected (v1/v2 no longer accepted)
     let mut v2 = bytes;
     v2[0] = 2;
     assert!(matches!(
@@ -246,7 +261,7 @@ async fn tofu_bootstrap_lands_in_pinstore() {
         device_ed25519: device.ed25519_public(),
     });
 
-    // 首连 TOFU：confirm_tofu_and_pin 落钉扎
+    // First connect TOFU: confirm_tofu_and_pin lands the pin
     let (a, b) = duplex_pair();
     let server_ident = flock_protocol::session::ServerIdentity {
         cluster_id: server.cluster_id,
@@ -285,23 +300,24 @@ async fn tofu_bootstrap_lands_in_pinstore() {
     assert_eq!(
         pins.verify_pinned(&cluster.directory.cluster_id, &cluster.root.verifying_key()),
         PinVerdict::Match,
-        "TOFU 确认后根公钥已钉扎"
+        "the root public key is pinned after TOFU confirmation"
     );
     assert_eq!(
         flock_protocol::session::fingerprint_ed25519(
             pins.pinned_root(&cluster.directory.cluster_id).unwrap()
         ),
         expected_fp,
-        "钉扎的即展示指纹的本体"
+        "what is pinned is exactly the thing whose fingerprint was displayed"
     );
     let server_tunnel = srv.await.expect("srv");
     client.shutdown().await;
     server_tunnel.shutdown().await;
 
-    // 二连：同根 ⇒ Match（不再 TOFU）；换根 ⇒ RootChanged 告警路径
+    // Second connect: same root ⇒ Match (no more TOFU); swapped root ⇒
+    // RootChanged alert path
     let bad = SigningKey::from_bytes(&[9; 32]);
     match pins.verify_pinned(&cluster.directory.cluster_id, &bad.verifying_key()) {
         PinVerdict::Mismatch { .. } => {}
-        v => panic!("换根必须 Mismatch（显式告警路径），got {v:?}"),
+        v => panic!("a swapped root must yield Mismatch (explicit alert path), got {v:?}"),
     }
 }

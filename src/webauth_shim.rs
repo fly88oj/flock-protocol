@@ -1,14 +1,18 @@
-//! M8b Web UI 的 wasm C-ABI 垫片（docs/design.md §7-M8.6 契约逐字；showroom
-//! `wasm_shim.rs` 手法——无 wasm-bindgen，JS 胶水按 C-ABI 直调）。
+//! The wasm C-ABI shim for the M8b Web UI (docs/design.md §7-M8.6
+//! contract verbatim; the showroom `wasm_shim.rs` technique — no
+//! wasm-bindgen, JS glue calls straight through the C-ABI).
 //!
-//! 编译门（对设计 §M8.6 字面 `wasm + wasm32` 的一处显式扩展）：`wasm` **且**
-//! `anchor` feature（login_finish 的 anchor 验签依赖 `pake::anchor` 面），目标
-//! `wasm32` **或** `test`（native 单测直接调垫片函数跑通 OPAQUE 全程——注入熵
-//! 固定；见 mod tests）。构建档（§M8.1）：
+//! Compilation gate (one explicit extension of the design §M8.6's literal
+//! `wasm + wasm32`): the `wasm` **and** `anchor` features (login_finish's
+//! anchor verification depends on the `pake::anchor` surface), target
+//! `wasm32` **or** `test` (native unit tests call the shim functions
+//! directly to run the full OPAQUE flow — with injected fixed entropy;
+//! see mod tests). Build profile (§M8.1):
 //! `cargo build -p flock-protocol --target wasm32-unknown-unknown
-//!  --no-default-features --features wasm,anchor`（无 zstd ⇒ 零 C 依赖）。
+//!  --no-default-features --features wasm,anchor` (no zstd ⇒ zero C
+//! dependencies).
 //!
-//! 契约（§M8.6 逐字）：
+//! Contract (§M8.6 verbatim):
 //! ```text
 //! sr_wasm_inject_entropy(ptr: *const u8, len: usize)
 //! sr_wasm_alloc(len: usize) -> *mut u8 / sr_wasm_free(ptr, len)
@@ -17,19 +21,25 @@
 //!                     bind_token_ptr(16B), anchor_sig_ptr(64B), out_ptr, out_cap) -> i32
 //! sr_web_pw_begin(user_ptr, user_len, pw_ptr, pw_len, out_ptr, out_cap) -> i32
 //! sr_web_pw_finish(m2_ptr, m2_len, out_ptr, out_cap) -> i32
-//! 错误码：-1 未注入熵；-2 pake 失败（错口令/坏报文同码）；-3 anchor 验签拒；
-//!         -4 out 容量不足。返回 0 = ok；out 写 b64 报文（NUL 结尾）。
+//! error codes: -1 no entropy injected; -2 pake failure (wrong password/bad message share the code);
+//!              -3 anchor verification rejected; -4 out capacity insufficient. 0 = ok;
+//! out receives the b64 message (NUL-terminated).
 //! ```
 //!
-//! 熵池：本模块自持 `Mutex<Option<StdRng>>`（与 [`crate::wasm_bridge`] 同折叠
-//! 算法），驱动 login_start/reg_start 显式 RNG；wasm32 下 `sr_wasm_inject_entropy`
-//! **双写两池**——wasm_bridge 池服务 getrandom 面（`pake::login_finish` 内部的
-//! `rand::rng()` 在 wasm32 经 custom 后端取熵）。native（test）下 getrandom 走
-//! OS 熵源，仅垫片池参与注入熵固定断言。
+//! Entropy pool: this module holds its own `Mutex<Option<StdRng>>` (same
+//! folding algorithm as [`crate::wasm_bridge`]), driving the explicit
+//! RNG of login_start/reg_start; under wasm32,
+//! `sr_wasm_inject_entropy` **writes both pools** — the wasm_bridge pool
+//! serves the getrandom surface (the `rand::rng()` inside
+//! `pake::login_finish` draws entropy via the custom backend on wasm32).
+//! On native (test), getrandom uses the OS entropy source and only the
+//! shim pool participates in the fixed-injected-entropy assertions.
 //!
-//! 状态单槽（§M8.6）：ClientLogin/ClientRegistration 模块级单槽，后一次 begin
-//! 覆盖前一次；finish 消费（take）并复用 begin 时缓存的 user/pw（rwd 需要二者，
-//! C-ABI finish 签名不重复传——与 showroom 同取舍）。
+//! Single state slot (§M8.6): ClientLogin/ClientRegistration live in a
+//! module-level single slot; a later begin overwrites the earlier one;
+//! finish consumes (take) and reuses the user/pw cached at begin time
+//! (rwd needs both, and the C-ABI finish signature does not re-pass them
+//! — the same tradeoff as showroom).
 
 use std::sync::Mutex;
 
@@ -39,26 +49,30 @@ use rand::SeedableRng;
 use crate::pake::{self, Profile, Suite};
 
 // ============================================================================
-// 错误码（§M8.6 定死）
+// Error codes (fixed by §M8.6)
 // ============================================================================
 
-/// -1：未注入熵。
+/// -1: no entropy injected.
 pub const ERR_NO_ENTROPY: i32 = -1;
-/// -2：pake 失败（错口令/坏报文同码——不泄漏原因）。
+/// -2: pake failure (wrong password/bad message share the code — no
+/// reason leaked).
 pub const ERR_PAKE: i32 = -2;
-/// -3：anchor 验签拒（伪服务器/错集群响应混装）。
+/// -3: anchor verification rejected (fake server / wrong-cluster
+/// response mix-up).
 pub const ERR_ANCHOR: i32 = -3;
-/// -4：out 容量不足。
+/// -4: out capacity insufficient.
 pub const ERR_CAPACITY: i32 = -4;
 
 // ============================================================================
-// 熵池（垫片自持；wasm32 下与 wasm_bridge 池同刻双种）
+// Entropy pool (shim-owned; seeded into both pools at once together with
+// the wasm_bridge pool under wasm32)
 // ============================================================================
 
 static POOL: Mutex<Option<StdRng>> = Mutex::new(None);
 
-/// 熵折叠进 32B seed（与 [`crate::wasm_bridge::inject_entropy`] 同算法——位置相关
-/// 旋转，超长输入每字节都影响 seed）。
+/// Fold entropy into a 32B seed (same algorithm as
+/// [`crate::wasm_bridge::inject_entropy`] — position-dependent rotation;
+/// every byte of an over-long input influences the seed).
 fn pool_inject(bytes: &[u8]) {
     let mut seed = [0u8; 32];
     for (i, b) in bytes.iter().enumerate() {
@@ -67,8 +81,9 @@ fn pool_inject(bytes: &[u8]) {
     *POOL.lock().expect("webauth_shim pool lock") = Some(StdRng::from_seed(seed));
 }
 
-/// 池内取 RNG 执行（未注入熵 ⇒ -1；调用期间持锁——单线程 wasm 无争用面，
-/// native 测试亦无并发垫片调用）。
+/// Run with the pool's RNG (no entropy injected ⇒ -1; the lock is held
+/// for the duration — single-threaded wasm has no contention surface,
+/// and native tests make no concurrent shim calls either).
 fn with_pool<T>(f: impl FnOnce(&mut StdRng) -> Result<T, i32>) -> Result<T, i32> {
     let mut g = POOL.lock().expect("webauth_shim pool lock");
     match g.as_mut() {
@@ -78,7 +93,8 @@ fn with_pool<T>(f: impl FnOnce(&mut StdRng) -> Result<T, i32>) -> Result<T, i32>
 }
 
 // ============================================================================
-// 状态单槽（后一次 begin 覆盖前一次；finish 消费）
+// Single state slot (a later begin overwrites the earlier one; finish
+// consumes)
 // ============================================================================
 
 struct LoginSlot {
@@ -97,27 +113,33 @@ static LOGIN_SLOT: Mutex<Option<LoginSlot>> = Mutex::new(None);
 static REG_SLOT: Mutex<Option<RegSlot>> = Mutex::new(None);
 
 // ============================================================================
-// C-ABI 面（全部 #[no_mangle] pub extern "C"；收裸指针的导出一律 unsafe fn——
-// 调用方（JS 胶水/native 测试）按契约保证缓冲有效；符号名/ABI 不受影响）
+// C-ABI surface (all #[no_mangle] pub extern "C"; exports taking raw
+// pointers are uniformly unsafe fn — the caller (JS glue/native tests)
+// guarantees valid buffers per the contract; symbol names/ABI unaffected)
 // ============================================================================
 
-/// 熵注入（JS 启动即调：crypto.getRandomValues ≥32B）。wasm32 下同刻种
-/// wasm_bridge 池（getrandom custom 后端——`rand::rng()` 内部取熵路径）。
+/// Entropy injection (JS calls it at startup: crypto.getRandomValues
+/// with at least 32B). Under wasm32 also seeds the wasm_bridge pool at
+/// the same moment (the getrandom custom backend — the entropy path
+/// inside `rand::rng()`).
 ///
 /// # Safety
 ///
-/// `ptr` 须指向 `len` 字节可读内存。
+/// `ptr` must point to `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn sr_wasm_inject_entropy(ptr: *const u8, len: usize) {
-    // SAFETY：JS 胶水契约——ptr 指向 len 字节可读缓冲（由 sr_wasm_alloc 分配或
-    // TextEncoder 写入的 wasm 线性内存段）。
+    // SAFETY: JS glue contract — ptr points to len readable bytes
+    // (allocated by sr_wasm_alloc or a wasm linear-memory segment written
+    // by TextEncoder).
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     pool_inject(bytes);
     #[cfg(target_arch = "wasm32")]
     crate::wasm_bridge::inject_entropy(bytes);
 }
 
-/// JS 写参/读返回的缓冲分配（零容量语义：分配未初始化；配对 [`sr_wasm_free`]）。
+/// Buffer allocation for JS to write arguments into and read returns
+/// from (zero-capacity semantics: uninitialized allocation; paired with
+/// [`sr_wasm_free`]).
 #[no_mangle]
 pub extern "C" fn sr_wasm_alloc(len: usize) -> *mut u8 {
     let mut v = Vec::with_capacity(len);
@@ -126,26 +148,31 @@ pub extern "C" fn sr_wasm_alloc(len: usize) -> *mut u8 {
     ptr
 }
 
-/// 释放 [`sr_wasm_alloc`] 的缓冲（ptr/len 须与分配一致）。
+/// Free a buffer from [`sr_wasm_alloc`] (ptr/len must match the
+/// allocation).
 ///
 /// # Safety
 ///
-/// ptr 必须来自 [`sr_wasm_alloc`]（同 len）；不得二次释放。
+/// ptr must come from [`sr_wasm_alloc`] (same len); no double frees.
 #[no_mangle]
 pub unsafe extern "C" fn sr_wasm_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() {
         return;
     }
-    // SAFETY：调用方契约——ptr 来自 sr_wasm_alloc(len)（capacity=len），此处按
-    // 同参数重建 Vec 并 drop（len=0：分配面未初始化，不读内容）。
+    // SAFETY: caller contract — ptr came from sr_wasm_alloc(len)
+    // (capacity=len); here the Vec is rebuilt with the same parameters
+    // and dropped (len=0: the allocation surface is uninitialized, its
+    // contents are not read).
     drop(Vec::from_raw_parts(ptr, 0, len));
 }
 
-/// 登录第一步：user+pw → ke1_b64（发 POST /api/login-begin）；状态入单槽。
+/// Login step 1: user+pw → ke1_b64 (sent as POST /api/login-begin);
+/// state goes into the single slot.
 ///
 /// # Safety
 ///
-/// user/pw 入参指针指向各自 len 字节可读缓冲；out_ptr 指向 out_cap 字节可写缓冲。
+/// user/pw argument pointers point to their own len readable bytes;
+/// out_ptr points to out_cap writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn sr_web_login_begin(
     user_ptr: *const u8,
@@ -155,7 +182,8 @@ pub unsafe extern "C" fn sr_web_login_begin(
     out_ptr: *mut u8,
     out_cap: usize,
 ) -> i32 {
-    // SAFETY：unsafe fn 体——契约由函数级 # Safety 文档承担。
+    // SAFETY: unsafe fn body — the contract is carried by the
+    // function-level # Safety doc.
     let user = str_from_raw(user_ptr, user_len);
     let pw = str_from_raw(pw_ptr, pw_len);
     let r = with_pool(|rng| {
@@ -167,13 +195,16 @@ pub unsafe extern "C" fn sr_web_login_begin(
     flatten(r)
 }
 
-/// 登录收尾：ke2 + anchor 材料 → ke3_b64（anchor 验签在 wasm 内——防错集群响应
-/// 混装；identity_pub 来自 GET /api/bootstrap）。消费 login 单槽。
+/// Login finish: ke2 + anchor material → ke3_b64 (anchor verification
+/// happens inside wasm — preventing wrong-cluster response mix-ups;
+/// identity_pub comes from GET /api/bootstrap). Consumes the login
+/// single slot.
 ///
 /// # Safety
 ///
-/// ke2 指向 ke2_len 字节可读缓冲；server_id/identity_pub/bind_token/anchor_sig
-/// 分别指向 16/32/16/64 字节可读缓冲；out_ptr 指向 out_cap 字节可写缓冲。
+/// ke2 points to ke2_len readable bytes; server_id/identity_pub/
+/// bind_token/anchor_sig point to 16/32/16/64 readable bytes
+/// respectively; out_ptr points to out_cap writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn sr_web_login_finish(
     ke2_ptr: *const u8,
@@ -185,7 +216,8 @@ pub unsafe extern "C" fn sr_web_login_finish(
     out_ptr: *mut u8,
     out_cap: usize,
 ) -> i32 {
-    // SAFETY：unsafe fn 体——契约由函数级 # Safety 文档承担。
+    // SAFETY: unsafe fn body — the contract is carried by the
+    // function-level # Safety doc.
     let ke2 = str_from_raw(ke2_ptr, ke2_len);
     let server_id = fixed::<16>(server_id_ptr);
     let identity_pub = fixed::<32>(identity_pub_ptr);
@@ -193,20 +225,23 @@ pub unsafe extern "C" fn sr_web_login_finish(
     let anchor_sig = fixed::<64>(anchor_sig_ptr);
 
     let Some(LoginSlot { state, user, pw }) = LOGIN_SLOT.lock().expect("login slot").take() else {
-        return ERR_PAKE; // 无在途 begin（未 begin/已消费）——pake 面同码
+        return ERR_PAKE; // no in-flight begin (never begun/already consumed) — same code as the pake surface
     };
 
-    // anchor 验签（login_finish_anchored 同 canonical：label‖server_id‖len(user)‖
-    // user‖ke2‖bind_token）。前置独立验一次以区分 -3（anchor 拒）与 -2（pake 拒）
-    //——随后 login_finish_anchored 内部再验（同字节、同钥），成功路径双验代价为
-    // 一次 Ed25519 verify（~50µs 量级，可忽略）。
+    // Anchor verification (same canonical as login_finish_anchored:
+    // label‖server_id‖len(user)‖user‖ke2‖bind_token). Verified once up
+    // front, independently, to distinguish -3 (anchor rejected) from -2
+    // (pake rejected) — login_finish_anchored then verifies again
+    // internally (same bytes, same key); the success path pays one extra
+    // Ed25519 verify for the double check (~50µs magnitude,
+    // negligible).
     use crate::ed25519_dalek::Verifier as _;
     let (verifying, signature) = match (
         crate::ed25519_dalek::VerifyingKey::from_bytes(&identity_pub),
         crate::ed25519_dalek::Signature::from_slice(&anchor_sig),
     ) {
         (Ok(v), Ok(s)) => (v, s),
-        _ => return ERR_ANCHOR, // 坏钥/坏签长度按验签拒归类（不泄漏细节）
+        _ => return ERR_ANCHOR, // bad key/bad signature length classified as verification rejection (no detail leaked)
     };
     let canonical = pake::anchor_canonical_bytes(&server_id, &user, &ke2, &bind_token);
     if verifying.verify(&canonical, &signature).is_err() {
@@ -223,7 +258,7 @@ pub unsafe extern "C" fn sr_web_login_finish(
         &pw,
         &user,
         &ke2,
-        Profile::default(), // Web 登录客户端恒用 Owasp19MiB（=default，§M8.3）
+        Profile::default(), // the Web login client always uses Owasp19MiB (=default, §M8.3)
         &expect,
         &anchor_sig,
     ) {
@@ -235,10 +270,12 @@ pub unsafe extern "C" fn sr_web_login_finish(
     }
 }
 
-/// 注册第一步（口令引导流共用）：user+pw → m1_b64（发 POST /api/pw-begin）。
+/// Registration step 1 (shared with the password bootstrap flow):
+/// user+pw → m1_b64 (sent as POST /api/pw-begin).
 /// # Safety
 ///
-/// user/pw 入参指针指向各自 len 字节可读缓冲；out_ptr 指向 out_cap 字节可写缓冲。
+/// user/pw argument pointers point to their own len readable bytes;
+/// out_ptr points to out_cap writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn sr_web_pw_begin(
     user_ptr: *const u8,
@@ -248,7 +285,8 @@ pub unsafe extern "C" fn sr_web_pw_begin(
     out_ptr: *mut u8,
     out_cap: usize,
 ) -> i32 {
-    // SAFETY：unsafe fn 体——契约由函数级 # Safety 文档承担。
+    // SAFETY: unsafe fn body — the contract is carried by the
+    // function-level # Safety doc.
     let user = str_from_raw(user_ptr, user_len);
     let pw = str_from_raw(pw_ptr, pw_len);
     let r = with_pool(|rng| {
@@ -260,14 +298,17 @@ pub unsafe extern "C" fn sr_web_pw_begin(
     flatten(r)
 }
 
-/// 注册收尾：m2_b64 → record_b64（发 POST /api/pw-commit）。消费 pw 单槽。
+/// Registration finish: m2_b64 → record_b64 (sent as POST
+/// /api/pw-commit). Consumes the pw single slot.
 ///
 /// # Safety
 ///
-/// m2 指向 m2_len 字节可读缓冲；out_ptr 指向 out_cap 字节可写缓冲。
+/// m2 points to m2_len readable bytes; out_ptr points to out_cap
+/// writable bytes.
 /// # Safety
 ///
-/// m2 指向 m2_len 字节可读缓冲；out_ptr 指向 out_cap 字节可写缓冲。
+/// m2 points to m2_len readable bytes; out_ptr points to out_cap
+/// writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn sr_web_pw_finish(
     m2_ptr: *const u8,
@@ -275,7 +316,8 @@ pub unsafe extern "C" fn sr_web_pw_finish(
     out_ptr: *mut u8,
     out_cap: usize,
 ) -> i32 {
-    // SAFETY：unsafe fn 体——契约由函数级 # Safety 文档承担。
+    // SAFETY: unsafe fn body — the contract is carried by the
+    // function-level # Safety doc.
     let m2 = str_from_raw(m2_ptr, m2_len);
     let Some(RegSlot { state, user, pw }) = REG_SLOT.lock().expect("reg slot").take() else {
         return ERR_PAKE;
@@ -289,40 +331,44 @@ pub unsafe extern "C" fn sr_web_pw_finish(
 }
 
 // ============================================================================
-// 内部工具（非 ABI 面）
+// Internal helpers (not part of the ABI surface)
 // ============================================================================
 
-/// 裸指针 → 有损 UTF-8 字符串（b64/口令/用户名均 ASCII 面；有损解码不构成失败路径）。
+/// Raw pointer → lossy UTF-8 string (b64/passwords/usernames are all
+/// ASCII surfaces; lossy decoding forms no failure path).
 ///
 /// # Safety
 ///
-/// `ptr` 须指向 `len` 字节可读内存。
+/// `ptr` must point to `len` readable bytes.
 unsafe fn str_from_raw(ptr: *const u8, len: usize) -> String {
     String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).into_owned()
 }
 
-/// 裸指针 → 定长数组（anchor 材料/签名的 16/32/64B 面）。
+/// Raw pointer → fixed-length array (the 16/32/64B surfaces of anchor
+/// material/signatures).
 ///
 /// # Safety
 ///
-/// `ptr` 须指向 `N` 字节可读内存。
+/// `ptr` must point to `N` readable bytes.
 unsafe fn fixed<const N: usize>(ptr: *const u8) -> [u8; N] {
     let mut out = [0u8; N];
     out.copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, N) });
     out
 }
 
-/// out 写 b64 报文 + NUL 结尾；容量不足 ⇒ -4。
+/// Write the b64 message + NUL terminator to out; insufficient capacity
+/// ⇒ -4.
 ///
 /// # Safety
 ///
-/// `out_ptr` 须指向 `out_cap` 字节可写内存。
+/// `out_ptr` must point to `out_cap` writable bytes.
 unsafe fn write_out(out_ptr: *mut u8, out_cap: usize, s: &str) -> Result<(), i32> {
     let bytes = s.as_bytes();
     if bytes.len() + 1 > out_cap {
         return Err(ERR_CAPACITY);
     }
-    // SAFETY：上方已验容量；整段覆写不读未初始化字节。
+    // SAFETY: capacity verified above; the whole segment is overwritten
+    // and never reads uninitialized bytes.
     let buf = unsafe { std::slice::from_raw_parts_mut(out_ptr, bytes.len() + 1) };
     buf[..bytes.len()].copy_from_slice(bytes);
     buf[bytes.len()] = 0;
@@ -337,8 +383,9 @@ fn flatten(r: Result<(), i32>) -> i32 {
 }
 
 // ============================================================================
-// native 垫片单测（§M8.9 wasm 面——「native 直接调垫片函数跑通 OPAQUE 全程，
-// 用注入熵固定」；服务器侧用真实 pake::server_* 构造对端）
+// Native shim unit tests (§M8.9 wasm surface — "native calls the shim
+// functions directly to run the full OPAQUE flow, with injected fixed
+// entropy"; the server side uses real pake::server_* to build the peer)
 // ============================================================================
 
 #[cfg(test)]
@@ -353,47 +400,53 @@ mod tests {
     use crate::rand;
 
     const SEED: &[u8] = &[0x5f_u8; 64];
-    /// JS 胶水同值的 out 缓冲容量。
+    /// Out-buffer capacity, same value as the JS glue.
     const OUT_CAP: usize = 64 * 1024;
-    /// 全局态（熵池/单槽）测试串行锁——垫片状态是进程级单例，并行测试互扰。
+    /// Serialization lock for the global state (entropy pool/slots) in
+    /// tests — the shim state is a process-level singleton; parallel
+    /// tests would interfere.
     static SERIAL: Mutex<()> = Mutex::new(());
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 裸指针调用辅助：把 bytes 写进垫片分配的缓冲再调 f(ptr, len)。
+    /// Raw-pointer call helper: write bytes into a shim-allocated buffer
+    /// then call f(ptr, len).
     fn with_buf(bytes: &[u8], f: impl FnOnce(*const u8, usize)) {
         let ptr = sr_wasm_alloc(bytes.len());
-        // SAFETY：ptr 刚由 sr_wasm_alloc(bytes.len()) 分配（len 字节可写）。
+        // SAFETY: ptr was just allocated by
+        // sr_wasm_alloc(bytes.len()) (len writable bytes).
         unsafe { std::slice::from_raw_parts_mut(ptr, bytes.len()) }.copy_from_slice(bytes);
         f(ptr, bytes.len());
-        // SAFETY：同 ptr/len 配对释放。
+        // SAFETY: paired free with the same ptr/len.
         unsafe { sr_wasm_free(ptr, bytes.len()) };
     }
 
     fn alloc_out() -> *mut u8 {
         sr_wasm_alloc(OUT_CAP)
     }
-    /// 读垫片写的 C 字符串（NUL 结尾）。
+    /// Read the C string written by the shim (NUL-terminated).
     fn read_out(ptr: *mut u8) -> String {
-        // SAFETY：out 缓冲由 sr_wasm_alloc(OUT_CAP) 分配；write_out 保证 NUL 结尾。
+        // SAFETY: the out buffer was allocated by
+        // sr_wasm_alloc(OUT_CAP); write_out guarantees the NUL
+        // terminator.
         let m = unsafe { std::slice::from_raw_parts(ptr, OUT_CAP) };
         let n = m.iter().position(|&b| b == 0).unwrap_or(m.len());
         String::from_utf8_lossy(&m[..n]).into_owned()
     }
     fn free_out(ptr: *mut u8) {
-        // SAFETY：alloc_out 的配对释放。
+        // SAFETY: paired free of alloc_out.
         unsafe { sr_wasm_free(ptr, OUT_CAP) };
     }
 
     fn inject(seed: &[u8]) {
         with_buf(seed, |p, l| {
-            // SAFETY：with_buf 提供有效 (ptr, len)。
+            // SAFETY: with_buf provides a valid (ptr, len).
             unsafe { sr_wasm_inject_entropy(p, l) }
         });
     }
 
-    /// 垫片 login_begin（native 直调）。
+    /// Shim login_begin (native direct call).
     fn shim_login_begin(user: &str, pw: &str) -> (i32, String) {
         let out = alloc_out();
         let rc = 0;
@@ -401,7 +454,7 @@ mod tests {
         let ret = std::cell::Cell::new(0i32);
         with_buf(pw.as_bytes(), |pp, pl| {
             with_buf(user.as_bytes(), |up, ul| {
-                // SAFETY：with_buf 提供有效缓冲。
+                // SAFETY: with_buf provides valid buffers.
                 ret.set(unsafe { sr_web_login_begin(up, ul, pp, pl, out, OUT_CAP) });
             })
         });
@@ -414,7 +467,8 @@ mod tests {
         (ret.get(), s)
     }
 
-    /// 垫片 login_finish（native 直调；ke2 + anchor 四件套）。
+    /// Shim login_finish (native direct call; ke2 + the anchor
+    /// four-piece set).
     #[allow(clippy::too_many_arguments)]
     fn shim_login_finish(
         ke2: &str,
@@ -430,7 +484,9 @@ mod tests {
                 with_buf(identity_pub.as_slice(), |ip, _il| {
                     with_buf(server_id.as_slice(), |s2, _l2| {
                         with_buf(ke2.as_bytes(), |kp, kl| {
-                            // SAFETY：C-ABI 契约参数齐（测试内缓冲均有效）。
+                            // SAFETY: the C-ABI contract's arguments are
+                            // all present (every buffer inside the test
+                            // is valid).
                             ret.set(unsafe {
                                 sr_web_login_finish(kp, kl, s2, ip, bp, sp, out, OUT_CAP)
                             });
@@ -448,8 +504,8 @@ mod tests {
         (ret.get(), s)
     }
 
-    /// 服务器侧材料（OPRF setup + 注册记录 + 身份钥），返回 (setup, record, sk,
-    /// server_id)。
+    /// Server-side material (OPRF setup + registration record + identity
+    /// key); returns (setup, record, sk, server_id).
     struct ServerSide {
         setup: crate::opaque_ke::ServerSetup<Suite>,
         record: crate::opaque_ke::ServerRegistration<Suite>,
@@ -472,8 +528,9 @@ mod tests {
         }
     }
 
-    /// 全程往返（注入熵固定）：login_begin → server_login_start+anchor_sign →
-    /// login_finish → server_login_finish 验 ke3。
+    /// Full round trip (injected fixed entropy): login_begin →
+    /// server_login_start+anchor_sign → login_finish →
+    /// server_login_finish verifying ke3.
     #[test]
     fn full_login_roundtrip_via_shim() {
         let _guard = serial();
@@ -481,7 +538,7 @@ mod tests {
         inject(SEED);
         let (rc, ke1) = shim_login_begin("shim-user", "shim-pw");
         assert_eq!(rc, 0, "login_begin rc");
-        assert!(ke1.len() > 100, "ke1 b64 形态（{}B）", ke1.len());
+        assert!(ke1.len() > 100, "ke1 b64 shape ({}B)", ke1.len());
 
         let mut rng = rand::rngs::OsRng;
         let (ke2, pending) =
@@ -497,33 +554,36 @@ mod tests {
             &bind_token,
             &sig,
         );
-        assert_eq!(rc, 0, "login_finish rc（anchor 验签过）");
+        assert_eq!(rc, 0, "login_finish rc (anchor verification passed)");
         assert!(
             server_login_finish(&pending, &ke3).is_ok(),
-            "ke3 服务端验过"
+            "ke3 verified by the server"
         );
     }
 
-    /// -1 未注入熵：begin 在空池上拒绝。
+    /// -1 no entropy: begin rejected on an empty pool.
     #[test]
     fn err_no_entropy_before_inject() {
         let _guard = serial();
-        *POOL.lock().unwrap() = None; // 空态（注入可重复语义的对偶面）
+        *POOL.lock().unwrap() = None; // empty state (the dual face of the repeatable-inject semantics)
         let (rc, _) = shim_login_begin("u", "pw");
         assert_eq!(rc, ERR_NO_ENTROPY);
-        // 池复位供后续测试（测试间共享全局池——顺序不敏感化）。
+        // Reset the pool for subsequent tests (tests share the global
+        // pool — making it order-insensitive).
         inject(SEED);
     }
 
-    /// -2 pake 失败：错口令（客户端本地 finish 拒）与空槽 finish 同码。
+    /// -2 pake failure: wrong password (the client's local finish
+    /// rejects) and an empty-slot finish share the code.
     #[test]
     fn err_pake_wrong_password_and_empty_slot() {
         let _guard = serial();
         inject(SEED);
         let srv = server_side("alice", "right");
-        // 空槽 finish（未 begin 即 finish）——显式清槽（前序测试的 begin 残留面）。
+        // Empty-slot finish (finish without begin) — explicit slot clear
+        // (residue of a previous test's begin).
         LOGIN_SLOT.lock().unwrap().take();
-        // 空槽 finish（未 begin 即 finish）。
+        // Empty-slot finish (finish without begin).
         let (rc, _) = shim_login_finish(
             "x",
             &[0u8; 16],
@@ -531,9 +591,10 @@ mod tests {
             &[0u8; 16],
             &Signature::from_bytes(&[0u8; 64]),
         );
-        assert_eq!(rc, ERR_PAKE, "空槽 = -2");
+        assert_eq!(rc, ERR_PAKE, "empty slot = -2");
 
-        // 错口令：begin("wrong") 后用正确 ke2 finish ⇒ rwd 不匹配 ⇒ -2。
+        // Wrong password: begin("wrong") then finish with the correct
+        // ke2 ⇒ rwd mismatch ⇒ -2.
         let (rc, ke1) = shim_login_begin("alice", "wrong");
         assert_eq!(rc, 0);
         let mut rng = rand::rngs::OsRng;
@@ -548,11 +609,12 @@ mod tests {
             &bind_token,
             &sig,
         );
-        assert_eq!(rc, ERR_PAKE, "错口令 = -2");
-        assert!(ke3.is_empty(), "ke3 不产生");
+        assert_eq!(rc, ERR_PAKE, "wrong password = -2");
+        assert!(ke3.is_empty(), "ke3 not produced");
     }
 
-    /// -3 anchor 验签拒：攻击者密钥签的 anchor（伪服务器面）。
+    /// -3 anchor verification rejected: an anchor signed with an
+    /// attacker's key (the fake-server surface).
     #[test]
     fn err_anchor_forged_signature() {
         let _guard = serial();
@@ -574,11 +636,11 @@ mod tests {
             &bind_token,
             &forged,
         );
-        assert_eq!(rc, ERR_ANCHOR, "伪 anchor = -3（ke3 不产生）");
+        assert_eq!(rc, ERR_ANCHOR, "forged anchor = -3 (ke3 not produced)");
         assert!(ke3.is_empty());
     }
 
-    /// -4 out 容量不足。
+    /// -4 out capacity insufficient.
     #[test]
     fn err_capacity_too_small() {
         let _guard = serial();
@@ -587,17 +649,18 @@ mod tests {
         let ret = std::cell::Cell::new(0i32);
         with_buf(b"pw".as_slice(), |pp, pl| {
             with_buf(b"user".as_slice(), |up, ul| {
-                // SAFETY：with_buf 提供有效缓冲。
+                // SAFETY: with_buf provides valid buffers.
                 ret.set(unsafe { sr_web_login_begin(up, ul, pp, pl, small, 8) });
             })
         });
-        // SAFETY：配对释放。
+        // SAFETY: paired free.
         unsafe { sr_wasm_free(small, 8) };
         assert_eq!(ret.get(), ERR_CAPACITY);
     }
 
-    /// 注册全程经垫片：pw_begin → server_reg_start → pw_finish → record 可被
-    /// 服务端接受，且与 login 面闭环。
+    /// Full registration flow via the shim: pw_begin → server_reg_start
+    /// → pw_finish → the record is acceptable to the server, and closes
+    /// the loop with the login surface.
     #[test]
     fn full_pw_bootstrap_roundtrip_via_shim() {
         let _guard = serial();
@@ -609,7 +672,7 @@ mod tests {
         let rc_m1 = std::cell::Cell::new(0i32);
         with_buf(b"NewPw-9x".as_slice(), |pp, pl| {
             with_buf(b"newbie".as_slice(), |up, ul| {
-                // SAFETY：with_buf 提供有效缓冲。
+                // SAFETY: with_buf provides valid buffers.
                 rc_m1.set(unsafe { sr_web_pw_begin(up, ul, pp, pl, m1_out, OUT_CAP) });
             })
         });
@@ -621,7 +684,7 @@ mod tests {
         let rec_out = alloc_out();
         let rc_rec = std::cell::Cell::new(0i32);
         with_buf(m2.as_bytes(), |mp, ml| {
-            // SAFETY：C-ABI 契约参数齐。
+            // SAFETY: the C-ABI contract's arguments are all present.
             rc_rec.set(unsafe { sr_web_pw_finish(mp, ml, rec_out, OUT_CAP) });
         });
         assert_eq!(rc_rec.get(), 0, "pw_finish rc");
@@ -630,7 +693,8 @@ mod tests {
         let record = server_reg_canonical(&record).unwrap();
         let rec = server_record_from_b64(&record).unwrap();
 
-        // 闭环：record 登录全程（垫片 login 面）。
+        // Closed loop: the record over the full login flow (the shim's
+        // login surface).
         let (rc, ke1) = shim_login_begin("newbie", "NewPw-9x");
         assert_eq!(rc, 0);
         let (ke2, pending) =
@@ -650,30 +714,32 @@ mod tests {
         assert!(server_login_finish(&pending, &ke3).is_ok());
     }
 
-    /// 注入熵固定 ⇒ 确定性：同 seed 两次 login_begin 产出相同 ke1（证明垫片 RNG
-    /// 由注入熵驱动，非 OS 熵）。
+    /// Fixed injected entropy ⇒ determinism: two login_begins with the
+    /// same seed produce the same ke1 (proving the shim's RNG is driven
+    /// by the injected entropy, not OS entropy).
     #[test]
     fn injected_entropy_drives_deterministic_ke1() {
         let _guard = serial();
         inject(SEED);
         let (_, a) = shim_login_begin("det", "pw");
-        inject(SEED); // 重注入同 seed（重置语义）
+        inject(SEED); // re-inject the same seed (reset semantics)
         let (_, b) = shim_login_begin("det", "pw");
-        assert_eq!(a, b, "同 seed ⇒ 同 ke1（确定性）");
-        inject(&[0xAB; 64]); // 换 seed
+        assert_eq!(a, b, "same seed ⇒ same ke1 (deterministic)");
+        inject(&[0xAB; 64]); // different seed
         let (_, c) = shim_login_begin("det", "pw");
-        assert_ne!(a, c, "异 seed ⇒ 异 ke1");
+        assert_ne!(a, c, "different seed ⇒ different ke1");
     }
 
-    /// 单槽覆盖：后一次 begin 覆盖前一次（u1 begin → u2 begin → 用 u2 的 ke2
-    /// finish 成功；u1 状态已不可达）。
+    /// Single-slot overwrite: a later begin overwrites the earlier one
+    /// (u1 begin → u2 begin → finishing with u2's ke2 succeeds; u1's
+    /// state is unreachable).
     #[test]
     fn login_slot_last_begin_wins() {
         let _guard = serial();
         inject(SEED);
         let srv = server_side("u2", "pw2");
-        LOGIN_SLOT.lock().unwrap().take(); // 前序残留清面
-        let _ = shim_login_begin("u1", "pw1"); // 被覆盖
+        LOGIN_SLOT.lock().unwrap().take(); // clear prior residue
+        let _ = shim_login_begin("u1", "pw1"); // overwritten
         let (rc, ke1_u2) = shim_login_begin("u2", "pw2");
         assert_eq!(rc, 0);
         let (ke2, pending) = server_login_start(
@@ -693,13 +759,18 @@ mod tests {
             &bind_token,
             &sig,
         );
-        assert_eq!(rc, 0, "末次 begin 的状态可用（u2 流程收尾成功）");
+        assert_eq!(
+            rc, 0,
+            "the last begin's state is usable (u2's flow finishes successfully)"
+        );
         assert!(server_login_finish(&pending, &ke3).is_ok());
     }
 
-    /// 服务器侧签名器与垫片 verify 同 canonical（防垫片自造格式漂移——与
-    /// pake::anchor_canonical_bytes 逐字节一致由 login 全程往返间接实证，此处
-    /// 直接对 canonical 做一次签名/验签往返）。
+    /// The server-side signer and the shim's verify share the same
+    /// canonical (guarding against the shim drifting into its own format
+    /// — byte-for-byte agreement with pake::anchor_canonical_bytes is
+    /// indirectly proven by the full login round trip; here a direct
+    /// sign/verify round trip over the canonical).
     #[test]
     fn anchor_canonical_shim_matches_server() {
         let _guard = serial();
@@ -710,13 +781,14 @@ mod tests {
         let sig: Signature = sk.sign(&canonical);
         use crate::ed25519_dalek::Verifier as _;
         assert!(sk.verifying_key().verify(&canonical, &sig).is_ok());
-        // 异 ke2 ⇒ 验签拒（transcript 绑定）。
+        // A different ke2 ⇒ verification rejected (transcript bound).
         let other = pake::anchor_canonical_bytes(&server_id, "u", "ke2-b6d", &bind);
         assert!(sk.verifying_key().verify(&other, &sig).is_err());
     }
 
-    // login_start 直调一处（server_side 之外的独立用途实证：native OsRng 路径与
-    // 垫片池路径可互换——协议面相同）。
+    // One direct login_start call (independent-use evidence beyond
+    // server_side: the native OsRng path and the shim pool path are
+    // interchangeable — same protocol surface).
     #[test]
     fn native_login_start_remains_compatible() {
         let _guard = serial();

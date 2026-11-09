@@ -10,10 +10,12 @@ readme = "README.md"
 keywords = ["vpn", "cryptography", "kem", "noise", "protocol"]
 categories = ["cryptography", "network-programming"]
 
-# cdylib：wasm32 目标的 .wasm 产物面（M8b webauth_shim 的 C-ABI 导出需要
-# crate-type 含 cdylib 才落 .wasm 文件；wasm-bindgen 系 crate 同法）。rlib 保持
-# 主位——下游依赖方链接不受影响；原生构建多出一个无人
-# 消费的 cdylib 单元仅在显式 `-p flock-protocol` 构建时产出。
+# cdylib: the .wasm artifact surface for the wasm32 target (M8b
+# webauth_shim's C-ABI exports require crate-type to include cdylib for
+# a .wasm file to be produced; wasm-bindgen-style crates do the same).
+# rlib stays primary — downstream dependents' linking is unaffected; the
+# extra unconsumed cdylib unit in native builds is only produced when
+# building explicitly with `-p flock-protocol`.
 [lib]
 crate-type = ["rlib", "cdylib"]
 
@@ -26,48 +28,60 @@ sha2 = "0.11.1"
 sha2_compat = { package = "sha2", version = "0.10" }
 hkdf = "0.13.0"
 rand = "0.9"
-# ml-kem 0.3.3 走 rand_core 0.10 代际（与 rand 0.9 的 rand_core 0.9 不同代），
-# 库内以私有桥接适配（src/kem.rs），对外 RNG 面统一为 rand 0.9。
+# ml-kem 0.3.3 uses the rand_core 0.10 generation (a different generation
+# from rand 0.9's rand_core 0.9); the library adapts via a private bridge
+# (src/kem.rs), keeping the public RNG surface uniformly rand 0.9.
 rand_core = "0.10"
 base64 = "0.22"
 hex = "0.4"
 rsa = { version = "0.9.10", optional = true }
 opaque-ke = { version = "4.0.1", default-features = false, features = ["ristretto255"] }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
-# zstd 档 optional（feature `zstd`，默认开）：zstd-sys 含 C 源，交叉 wasm32 需 clang；
-# 无 C 工具链环境（如 rust:1-bookworm 容器）可关 default-features 编译核心协议面
-# （lz4_flex 纯 Rust 恒可用）。wasm 引用方声明 default-features=false 即此形态。
+# The zstd tier is optional (feature `zstd`, on by default): zstd-sys
+# carries C sources; cross-compiling to wasm32 needs clang. In
+# environments without a C toolchain (e.g. the rust:1-bookworm
+# container), default-features can be disabled to compile the core
+# protocol surface (lz4_flex is pure Rust and always available). A wasm
+# consumer declaring default-features=false gets exactly this shape.
 zstd = { version = "0.14.3", optional = true }
 lz4_flex = "0.14"
-# session/mux 批次（§1.3.3c/§1.3.3d /§3.5/§3.6）
+# session/mux batch (§1.3.3c/§1.3.3d /§3.5/§3.6)
 yamux = "0.14.1"
 chacha20poly1305 = "0.11.0"
 aes-gcm-siv = "0.12.1"
 futures = "0.3"
-# M7 roster 批次（§7-M7.4/§7-M7.7）：控制面共享契约消息线格式（两端同类型，纯数据无平台面）。
+# M7 roster batch (§7-M7.4/§7-M7.7): control-plane shared-contract
+# message wire formats (same types on both ends, pure data with no
+# platform surface).
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
-# 密钥材料确定性清零（设计 §1.3.3c「reject_after 触发即清零密钥」承诺）：
-# TrafficKeys/DirKeys/SealedShared、握手 k1/k_enc 与 KEM combine 的 ikm。
+# Deterministic zeroization of key material (design §1.3.3c
+# "reject_after zeroes keys on trigger" commitment):
+# TrafficKeys/DirKeys/SealedShared, handshake k1/k_enc, and the KEM
+# combine ikm.
 zeroize = "1.9"
 
-# wasm32：tokio net 不支持该目标（tokio Cargo.toml 将 socket2 限定非 wasm）；
-# session/mux 库代码只用 io-util/time/sync/rt/macros。原生构建仍走全量（含 net）。
+# wasm32: tokio net does not support this target (tokio's Cargo.toml
+# restricts socket2 to non-wasm); the session/mux library code uses only
+# io-util/time/sync/rt/macros. Native builds still take the full set
+# (including net).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "macros"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1", default-features = false, features = ["io-util", "time", "sync", "rt", "macros"] }
-# getrandom custom 后端（.cargo/config.toml 的 rustflags cfg）：桥见 src/wasm_bridge.rs。
-# 两代并存：0.3（rand 0.9 代际）走 extern 符号；0.2（rand_core 0.6 ← opaque-ke 路径）
-# 走 register_custom_getrandom! 宏，同一熵池供两代。
+# getrandom custom backend (the rustflags cfg in .cargo/config.toml):
+# the bridge is src/wasm_bridge.rs. Two generations coexist: 0.3 (the
+# rand 0.9 generation) via the extern symbol; 0.2 (rand_core 0.6 ← the
+# opaque-ke path) via the register_custom_getrandom! macro — one entropy
+# pool serves both.
 getrandom = "0.3"
 getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
 
 [dev-dependencies]
 serde_json = "1"
 tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "macros", "rt-multi-thread"] }
-# bench（§7-M1）：criterion 0.8（aes-gcm 复用正式依赖）
+# bench (§7-M1): criterion 0.8 (aes-gcm reuses the regular dependency)
 criterion = "0.8"
 
 [[bench]]
@@ -75,26 +89,37 @@ name = "aead"
 harness = false
 
 [features]
-# 默认开 zstd 档（全量行为不变）；default-features=false 的引用方（wasm 构建）
-# 显式关闭后 compress 模块仅 lz4 纯 Rust 档、wasm32 构建零 C 依赖。
+# The zstd tier is on by default (full behavior unchanged); consumers
+# with default-features=false (wasm builds) that disable it explicitly
+# get a compress module with only the pure-Rust lz4 tier, and wasm32
+# builds with zero C dependencies.
 default = ["zstd"]
 zstd = ["dep:zstd"]
-# —— feature 划分按 docs/design.md §1.3.1 ——
-# 默认（无具名 feature）＝全 VPN 档：sig / kem（混合 KEM）/ envelope v2 / pake / compress /
-# session / mux。trust 模块按后续里程碑批次加入默认档。
-# 信封 v1（RSA-OAEP）只读兼容：过渡用，默认关。
-# rsa/sha2：Oaep::new::<Sha256> 需与 rsa 同代的 sha2 0.10 摘要类型（rsa::sha2 再导出）。
+# —— feature split per docs/design.md §1.3.1 ——
+# Default (no named feature) = the full VPN tier: sig / kem (hybrid KEM) /
+# envelope v2 / pake / compress / session / mux. The trust module joins
+# the default tier in later milestone batches.
+# Envelope v1 (RSA-OAEP) read-only compatibility: transitional use, off
+# by default.
+# rsa/sha2: Oaep::new::<Sha256> needs a sha2 0.10 digest type of the same
+# generation as rsa (re-exported via rsa::sha2).
 legacy = ["dep:rsa", "rsa/sha2"]
-# OPAQUE 服务端身份签名层（P0-5 登录锚）：主仓构建里开，默认关（本批次仅占位）。
+# OPAQUE server-identity signature layer (P0-5 login anchor): enabled in
+# the main-repository build, off by default (placeholder only in this
+# batch).
 anchor = []
-# ML-DSA-65 并行公钥档（P2-12）：ml-dsa 0.1.1 未审计（crypto-2026 §5），默认关（本批次仅占位）。
+# ML-DSA-65 parallel public-key tier (P2-12): ml-dsa 0.1.1 is unaudited
+# (crypto-2026 §5), off by default (placeholder only in this batch).
 pq-sign = []
-# wasm 构建约束（getrandom custom 后端桥 src/wasm_bridge.rs）：默认关。
+# wasm build constraints (getrandom custom-backend bridge
+# src/wasm_bridge.rs): off by default.
 wasm = []
 
-# 独立仓库后无 workspace 根 [profile.*] 继承——按原 workspace 根原值就地保留
-#（测试 8MiB aes-gcm 在 -O0 0.61s vs -O1 0.013s，46×；bench 门槛需 LTO thin 收回
-#  跨 crate 内联损失，见 showroom-analysis §3）。
+# With the standalone repository there is no workspace-root [profile.*]
+# inheritance — the original workspace-root values are kept in place
+# (the 8MiB aes-gcm test: -O0 0.61s vs -O1 0.013s, 46×; the bench gate
+# needs LTO thin to reclaim cross-crate inlining losses, see
+# showroom-analysis §3).
 [profile.test]
 opt-level = 1
 
@@ -102,5 +127,6 @@ opt-level = 1
 lto = true
 codegen-units = 1
 
-# 防止父目录意外把本 crate 发现进某个 workspace（独立仓库形态）。
+# Prevents a parent directory from accidentally discovering this crate
+# into some workspace (standalone-repository form).
 [workspace]

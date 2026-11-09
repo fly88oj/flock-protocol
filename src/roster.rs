@@ -1,45 +1,62 @@
-//! M7 名册与控制面共享契约（docs/design.md §7-M7.4 / §2.2 / §3.11）。
+//! M7 roster and control-plane shared contracts (docs/design.md §7-M7.4 /
+//! §2.2 / §3.11).
 //!
-//! 本模块是 M7 客户端批次对服务端契约的**类型上收**（偿还架构债）：`PeerInfo`/`PeerKind`
-//! 与 `TicketWire`（票据线格式）原定义在 `flock-server`，客户端 `flock-client` 无法依赖
-//! 服务端 crate（依赖方向是 server → client 的 tun/route 复用），此前 OPAQUE 登录的
-//! 客户端半边只能由 server 测试代偿。上收后两端消费同一类型——**无第二真相源**：
+//! This module is the M7 client batch's **type lift-up** of the server
+//! contracts (repaying architectural debt): `PeerInfo`/`PeerKind` and
+//! `TicketWire` (the ticket wire format) were originally defined in
+//! `flock-server`, but the client `flock-client` cannot depend on the
+//! server crate (the dependency direction is server → client for
+//! tun/route reuse), so the client half of OPAQUE login previously had to
+//! be proxied by server tests. After the lift-up both ends consume the
+//! same types — **no second source of truth**:
 //!
-//! - 名册契约（§7-M7.4 逐字固化）：[`PeerKind`]/[`PeerInfo`] 与
-//!   `CtrlRequest::PeerListPull` → `CtrlResponse::PeerList`；
-//! - 票据线格式（最小面）：[`SignedTicket`]/[`TicketWire`]——**只搬线上形态**，票据
-//!   根签发/校验权威（`TicketAuthority`/`TicketIssuer`/nonce 记账）是服务端内部逻辑，
-//!   不在此列；
-//! - 控制面消息（§2.2/§3.11）：[`CtrlRequest`]/[`CtrlResponse`] 与值类型
-//!   [`DevicePubs`]/[`SrAuth`]/[`DeviceOp`]/[`DeviceRowWire`]/[`CtrlError`]、帧编解码
-//!   [`send_ctrl_msg`]/[`recv_ctrl_msg`]、key-bind 设备签名 canonical
-//!   （[`keybind_canonical`]）——客户端登录/key-bind 半边与服务端逐字节共享；
-//! - hostname 规范化（§7-M7.1）：[`normalize_hostname`]/[`HOSTNAME_MAX`]/
-//!   [`HOSTNAME_UNKNOWN`]（自 `flock-sync` 上收——客户端上报侧与服务端落库侧同一
-//!   截断/空串语义）。
+//! - Roster contract (§7-M7.4, frozen verbatim): [`PeerKind`]/
+//!   [`PeerInfo`] with `CtrlRequest::PeerListPull` →
+//!   `CtrlResponse::PeerList`;
+//! - Ticket wire format (minimal surface): [`SignedTicket`]/
+//!   [`TicketWire`] — **only the wire shape is moved**; the ticket-root
+//!   issuance/verification authority (`TicketAuthority`/`TicketIssuer`/
+//!   nonce bookkeeping) is server-internal logic and stays out;
+//! - Control-plane messages (§2.2/§3.11): [`CtrlRequest`]/
+//!   [`CtrlResponse`] with the value types
+//!   [`DevicePubs`]/[`SrAuth`]/[`DeviceOp`]/[`DeviceRowWire`]/
+//!   [`CtrlError`], frame codec [`send_ctrl_msg`]/[`recv_ctrl_msg`], and
+//!   the key-bind device-signature canonical ([`keybind_canonical`]) —
+//!   the client's login/key-bind half shares bytes with the server;
+//! - hostname normalization (§7-M7.1):
+//!   [`normalize_hostname`]/[`HOSTNAME_MAX`]/[`HOSTNAME_UNKNOWN`]
+//!   (lifted from `flock-sync` — the client's reporting side and the
+//!   server's persistence side share the same truncation/empty-string
+//!   semantics).
 //!
-//! 线格式纪律：全部类型为纯数据（serde/postcard），无平台面（wasm32 同编）；**postcard
-//! 无字段标签、enum 变体按声明序编码**——两端变体顺序与字段即冻结契约，任何变动都是
-//! 线上破坏性变更（与 `flock-sync` 快照兼容性同一纪律）；`CtrlResponse` 的追加位纪律
-//! 见其文档（新变体只允许 Err 之后尾部追加）。
+//! Wire-format discipline: all types are pure data (serde/postcard), no
+//! platform surface (wasm32 compiles the same); **postcard has no field
+//! tags and encodes enum variants in declaration order** — both ends'
+//! variant order and fields are the frozen contract; any change is a
+//! breaking wire change (the same discipline as `flock-sync` snapshot
+//! compatibility); `CtrlResponse`'s append-only discipline is documented
+//! on it (new variants may only be appended after Err).
 //!
-//! `flock-server::{control,ticket}` 与 `flock-sync::proto` 以 `pub use` 再导出本模块
-//! 类型（既有引用路径不变）。
+//! `flock-server::{control,ticket}` and `flock-sync::proto` re-export
+//! this module's types via `pub use` (existing reference paths
+//! unchanged).
 
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
-// 名册契约（§7-M7.4——契约逐字固化；装配逻辑在 flock-server，两端只共享行类型）
+// Roster contract (§7-M7.4 — contract frozen verbatim; assembly logic
+// lives in flock-server, both ends share only the row types)
 // ============================================================================
 
-/// 名册条目类型（设备 / 服务器自身——服务器也是 peer，§2.2）。
+/// Roster entry kind (device / the server itself — the server is also a
+/// peer, §2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerKind {
     Device,
     Server,
 }
 
-/// 名册条目（§7-M7.4 逐字契约）。
+/// Roster entry (§7-M7.4 verbatim contract).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub vip: [u8; 4],
@@ -48,19 +65,23 @@ pub struct PeerInfo {
     pub kind: PeerKind,
     pub online: bool,
     pub last_seen_unix: u64,
-    /// 设备视角 EWMA（bytes/s）：tx = 设备发出、rx = 设备收到。
+    /// Device-perspective EWMA (bytes/s): tx = sent by the device, rx =
+    /// received by the device.
     pub tx_bps: u64,
     pub rx_bps: u64,
 }
 
 // ============================================================================
-// 票据线格式（§2.2——最小面：线上形态；签发/校验权威在服务端 ticket.rs）
+// Ticket wire format (§2.2 — minimal surface: the wire shape; the
+// issuance/verification authority is in the server's ticket.rs)
 // ============================================================================
 
-/// 已签名票据（线上形态；postcard 载体）。
+/// A signed ticket (wire shape; postcard carrier).
 ///
-/// 对客户端不透明：登录取回、状态变更/名册请求回呈。`exp`/`iat` 可读（客户端据此
-/// 排周期重登保持票据新鲜，§7-M7.7）；签名校验是服务端职责。
+/// Opaque to the client: retrieved at login, presented again on
+/// state-change/roster requests. `exp`/`iat` are readable (the client
+/// schedules periodic re-login off them to keep the ticket fresh,
+/// §7-M7.7); signature verification is the server's job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedTicket {
     pub user: String,
@@ -71,11 +92,15 @@ pub struct SignedTicket {
     pub sig: Vec<u8>,
 }
 
-/// 控制流承载的会话票据（对客户端不透明 blob：登录取回、状态变更请求回呈）。
+/// The session ticket carried on the control stream (an opaque-to-client
+/// blob: retrieved at login, presented again on state-change requests).
 ///
-/// - [`TicketWire::Local`]：单服形态——票据根 = 本地状态库种子（[`SignedTicket`]）；
-/// - [`TicketWire::Sync`]：多主形态——票据根在 Raft 状态内（`flock_sync::ticket::Ticket`
-///   线格式；任何服务器都验得了——SR-SIG1 跨服重放面的闭合前提，§2.2）。
+/// - [`TicketWire::Local`]: single-server shape — ticket root = the local
+///   state-store seed ([`SignedTicket`]);
+/// - [`TicketWire::Sync`]: multi-primary shape — the ticket root lives
+///   inside Raft state (the `flock_sync::ticket::Ticket` wire format;
+///   verifiable by any server — the closure precondition for the
+///   SR-SIG1 cross-server replay surface, §2.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TicketWire {
     Local(SignedTicket),
@@ -83,8 +108,10 @@ pub enum TicketWire {
 }
 
 impl TicketWire {
-    /// 票据 TTL 估算（秒）：Local 可读 iat/exp；Sync 对客户端不透明 ⇒ 按 §2.2 缺省
-    /// 硬顶 60s 估（重登节奏保守侧成立——只是更频繁地重登，不影响正确性）。
+    /// Ticket TTL estimate (seconds): Local has readable iat/exp; Sync is
+    /// opaque to the client ⇒ assume the §2.2 default hard cap of 60s
+    /// (the re-login cadence errs on the conservative side — it merely
+    /// re-logs in more often, correctness is unaffected).
     pub fn ttl_hint_secs(&self) -> u64 {
         match self {
             TicketWire::Local(t) => t.exp.saturating_sub(t.iat),
@@ -94,15 +121,18 @@ impl TicketWire {
 }
 
 // ============================================================================
-// hostname 规范化（§7-M7.1——客户端上报侧与服务端落库侧同一语义；自 flock-sync 上收）
+// hostname normalization (§7-M7.1 — the client's reporting side and the
+// server's persistence side share the same semantics; lifted from
+// flock-sync)
 // ============================================================================
 
-/// 空上报 hostname 的落库默认值。
+/// Persistence default for an empty reported hostname.
 pub const HOSTNAME_UNKNOWN: &str = "(unknown)";
-/// hostname 长度上限（字节）。
+/// hostname length cap (bytes).
 pub const HOSTNAME_MAX: usize = 64;
 
-/// hostname 规范化：trim + 空串 ⇒ [`HOSTNAME_UNKNOWN`] + 超长截断（char 边界安全）。
+/// hostname normalization: trim + empty string ⇒ [`HOSTNAME_UNKNOWN`] +
+/// over-length truncation (char-boundary safe).
 pub fn normalize_hostname(raw: &str) -> String {
     let t = raw.trim();
     if t.is_empty() {
@@ -119,17 +149,22 @@ pub fn normalize_hostname(raw: &str) -> String {
 }
 
 // ============================================================================
-// 控制面消息（§2.2/§3.11——两端共享；装配/分发逻辑在各端）
+// Control-plane messages (§2.2/§3.11 — shared by both ends;
+// assembly/dispatch logic lives in each end)
 // ============================================================================
 
-/// 控制协议版本（Hello 交换；不匹配即拒——版本化，§3.11）。
+/// Control protocol version (Hello exchange; mismatch is rejected —
+/// versioned, §3.11).
 pub const CTRL_PROTO_VERSION: u32 = 1;
 
-/// 单条控制消息上限（防御性；远小于记录层 1MiB 上限）。
+/// Single control-message cap (defensive; far below the record layer's
+/// 1MiB cap).
 pub const MAX_CTRL_MSG: usize = 256 * 1024;
 
-/// 设备静态公钥集 + 入网上报主机名（key-bind/redeem 携带；M7——hostname 空串 ⇒
-/// 服务端落 "(unknown)"，客户端上报经 [`normalize_hostname`] 对齐）。
+/// Device static public keys + the onboarding-reported hostname
+/// (carried by key-bind/redeem; M7 — empty hostname ⇒ the server
+/// persists "(unknown)", the client's reporting aligns via
+/// [`normalize_hostname`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePubs {
     pub x25519: [u8; 32],
@@ -137,7 +172,8 @@ pub struct DevicePubs {
     pub hostname: String,
 }
 
-/// SR-SIG1 授权头（`SR-SIG1 user:ts:nonce:sig_b64url`，§1.3.2 逐字节同格式）。
+/// SR-SIG1 authorization header (`SR-SIG1 user:ts:nonce:sig_b64url`,
+/// §1.3.2 same format byte-for-byte).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SrAuth {
     pub header: String,
@@ -154,7 +190,7 @@ pub enum DeviceOp {
     Enable {
         device: [u8; 32],
     },
-    /// owner 名下设备清单（断言/诊断面）。
+    /// Device list under an owner (assertion/diagnostics surface).
     List,
 }
 
@@ -163,12 +199,13 @@ pub enum CtrlRequest {
     Hello {
         ver: u32,
     },
-    /// OPAQUE 注册第一步（设置口令；仅账号未设口令时）。
+    /// OPAQUE registration step 1 (set a password; only when the account
+    /// has none yet).
     PwBegin {
         user: String,
         m1_b64: String,
     },
-    /// OPAQUE 注册收尾（落 pass.opaque 记录）。
+    /// OPAQUE registration finish (persists the pass.opaque record).
     PwCommit {
         record_b64: String,
         profile: u16,
@@ -180,7 +217,8 @@ pub enum CtrlRequest {
     LoginFinish {
         ke3_b64: String,
     },
-    /// 设备公钥登记（状态变更：需票据 + bind_token 一次性 + 设备签名）。
+    /// Device public-key registration (state change: requires ticket +
+    /// one-time bind_token + device signature).
     KeyBind {
         ticket: TicketWire,
         bind_token: [u8; 16],
@@ -188,12 +226,13 @@ pub enum CtrlRequest {
         sr_sig_pub: [u8; 32],
         device_sig: Vec<u8>,
     },
-    /// 票据换发（状态变更：SR-SIG1 + 票据 + nonce；`ticket: None` = 无票据 ⇒ TicketMissing）。
+    /// Ticket renewal (state change: SR-SIG1 + ticket + nonce; `ticket:
+    /// None` = no ticket ⇒ TicketMissing).
     TicketRenew {
         ticket: Option<TicketWire>,
         auth: SrAuth,
     },
-    /// 邀请兑换（状态变更：SR-SIG1 + 票据 + nonce）。
+    /// Invite redemption (state change: SR-SIG1 + ticket + nonce).
     RedeemInvite {
         ticket: Option<TicketWire>,
         auth: SrAuth,
@@ -201,27 +240,33 @@ pub enum CtrlRequest {
         username: String,
         device: DevicePubs,
     },
-    /// 注册表操作（状态变更：SR-SIG1 + 票据 + nonce）。
+    /// Registry operation (state change: SR-SIG1 + ticket + nonce).
     DeviceOp {
         ticket: Option<TicketWire>,
         auth: SrAuth,
         op: DeviceOp,
     },
-    /// 目录拉取（只读，无需票据；根签 ClusterDirectory，§1.3.3f）。
+    /// Directory pull (read-only, no ticket needed; the root-signed
+    /// ClusterDirectory, §1.3.3f).
     DirPull {
         since_version: u64,
     },
-    /// M7（§7-M7.4）：成员名册拉取（登录票据保护——**票据校验先于名册数据装配**，
-    /// 契约序有测试断言）。
+    /// M7 (§7-M7.4): member roster pull (login-ticket protected —
+    /// **ticket validation precedes roster assembly**; the contract order
+    /// has a test assertion).
     PeerListPull {
         ticket: Option<TicketWire>,
     },
 }
 
-/// 控制面响应。**变体位纪律（append-only）**：postcard 按声明序编码判别位——`Err`
-/// **之前为冻结区**（变体不得插入/重排/复用判别位），新增变体一律在 `Err` **之后**
-/// 尾部追加。`PeerList` 自 Err 之前迁至其后是本纪律的第一次适用（会话态无持久
-/// 字节——控制面消息不落盘，两端同源重编译即可，无迁移面）。
+/// Control-plane response. **Variant-slot discipline (append-only)**:
+/// postcard encodes discriminants in declaration order — everything
+/// **before `Err` is a frozen zone** (no inserting/reordering/reusing
+/// discriminants); new variants are always appended at the tail **after
+/// `Err`**. `PeerList` migrating from before Err to after it was this
+/// discipline's first application (session state has no persisted bytes
+/// — control-plane messages are not persisted; both ends recompile from
+/// the same source, no migration surface).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CtrlResponse {
     Hello {
@@ -256,7 +301,8 @@ pub enum CtrlResponse {
     DeviceList {
         rows: Vec<DeviceRowWire>,
     },
-    /// dir_version 未变 ⇒ bytes 为空（客户端保留既有目录）。
+    /// dir_version unchanged ⇒ bytes is empty (the client keeps its
+    /// existing directory).
     Directory {
         dir_version: u64,
         bytes: Vec<u8>,
@@ -265,13 +311,14 @@ pub enum CtrlResponse {
         code: CtrlError,
         msg: String,
     },
-    /// M7（§7-M7.4）：成员名册（按 VIP 升序；契约逐字固化于 docs/design.md §7-M7.4）。
+    /// M7 (§7-M7.4): member roster (ascending by VIP; contract frozen
+    /// verbatim in docs/design.md §7-M7.4).
     PeerList {
         peers: Vec<PeerInfo>,
     },
 }
 
-/// 注册表行的线上形态。
+/// Wire shape of a registry row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRowWire {
     pub device_id: [u8; 32],
@@ -308,7 +355,8 @@ pub enum CtrlError {
 }
 
 impl CtrlError {
-    /// 错误码的缺省文案（线上 `Err.msg` 的构造源；两端日志/展示共用）。
+    /// Default message text for an error code (the construction source of
+    /// the wire `Err.msg`; shared by both ends' logs/display).
     pub fn msg(self) -> &'static str {
         match self {
             CtrlError::ProtoVersion => "control protocol version mismatch",
@@ -338,12 +386,18 @@ impl CtrlError {
     }
 }
 
-/// key-bind 设备签名域分离标签（公钥经登录态登记，受服务端身份签名覆盖的 bind_token 佐证）。
+/// key-bind device-signature domain-separation label (public keys
+/// registered via the login state, attested by the bind_token covered by
+/// the server-identity signature).
 pub const KEYBIND_LABEL: &[u8] = b"flock-server/control/key-bind/v1";
 
-/// key-bind 设备签名覆盖的规范化字节（§1.3.3f：占有证明；长度前缀定界杜绝拼接歧义）。
+/// Canonical bytes covered by the key-bind device signature (§1.3.3f:
+/// proof of possession; length-prefixed delimiting rules out splicing
+/// ambiguity).
 ///
-/// 客户端签名侧与服务端验签侧共享——签名覆盖面即契约，无第二真相源。
+/// Shared between the client's signing side and the server's verification
+/// side — the signature coverage is the contract, no second source of
+/// truth.
 #[allow(clippy::too_many_arguments)]
 pub fn keybind_canonical(
     cluster_id: &[u8; 16],
@@ -361,7 +415,9 @@ pub fn keybind_canonical(
     v.extend_from_slice(bind_token);
     v.extend_from_slice(&device.x25519);
     v.extend_from_slice(&device.ed25519);
-    // M7：hostname 进设备签名覆盖面（长度前缀定界——与 owner 同纪律，杜绝拼接歧义）。
+    // M7: hostname enters the device-signature coverage (length-prefixed
+    // delimiting — same discipline as owner, ruling out splicing
+    // ambiguity).
     v.extend_from_slice(&(device.hostname.len() as u32).to_le_bytes());
     v.extend_from_slice(device.hostname.as_bytes());
     v.extend_from_slice(sr_sig_pub);
@@ -369,10 +425,11 @@ pub fn keybind_canonical(
 }
 
 // ============================================================================
-// 帧编解码（§3.11：`[u32 LE len][postcard]`，futures-io 面——mux::Stream 实现之）
+// Frame codec (§3.11: `[u32 LE len][postcard]`, futures-io surface —
+// implemented by mux::Stream)
 // ============================================================================
 
-/// 发送一条控制消息（`[u32 LE len][postcard]`）。
+/// Send one control message (`[u32 LE len][postcard]`).
 pub async fn send_ctrl_msg<S: futures::io::AsyncWrite + Unpin, M: Serialize>(
     io: &mut S,
     msg: &M,
@@ -389,7 +446,7 @@ pub async fn send_ctrl_msg<S: futures::io::AsyncWrite + Unpin, M: Serialize>(
     io.flush().await
 }
 
-/// 接收一条控制消息。
+/// Receive one control message.
 pub async fn recv_ctrl_msg<S: futures::io::AsyncRead + Unpin, M: for<'de> Deserialize<'de>>(
     io: &mut S,
 ) -> std::io::Result<M> {
@@ -406,14 +463,16 @@ pub async fn recv_ctrl_msg<S: futures::io::AsyncRead + Unpin, M: for<'de> Deseri
 }
 
 // ============================================================================
-// 单元测试：纯数据契约往返 + 帧编解码回环（平台无关；wasm32 同编同测）
+// Unit tests: pure-data contract round trips + frame-codec loopback
+// (platform-independent; wasm32 compiles and runs the same)
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 名册条目 postcard 往返（字段逐项——线上形态冻结面的回归锚）。
+    /// Peer-entry postcard round trip (field by field — a regression
+    /// anchor for the frozen wire shape).
     #[test]
     fn peer_info_roundtrip() {
         let p = PeerInfo {
@@ -428,16 +487,22 @@ mod tests {
         };
         let bytes = postcard::to_allocvec(&p).unwrap();
         assert_eq!(postcard::from_bytes::<PeerInfo>(&bytes).unwrap(), p);
-        // Server 变体独立编码位（kind 判别不塌缩）。
+        // The Server variant gets its own encoding slot (the kind
+        // discriminant does not collapse).
         let s = PeerInfo {
             kind: PeerKind::Server,
             vip: [100, 64, 0, 1],
             ..p.clone()
         };
-        assert_ne!(postcard::to_allocvec(&s).unwrap(), bytes, "kind 进线格式");
+        assert_ne!(
+            postcard::to_allocvec(&s).unwrap(),
+            bytes,
+            "kind is part of the wire format"
+        );
     }
 
-    /// 票据线格式往返 + TTL hint（Local 读 iat/exp；Sync 保守 60s）。
+    /// Ticket wire-format round trip + TTL hint (Local reads iat/exp;
+    /// Sync conservatively 60s).
     #[test]
     fn ticket_wire_roundtrip_and_ttl_hint() {
         let t = TicketWire::Local(SignedTicket {
@@ -452,7 +517,7 @@ mod tests {
         assert_eq!(postcard::from_bytes::<TicketWire>(&bytes).unwrap(), t);
         assert_eq!(t.ttl_hint_secs(), 60);
         assert_eq!(TicketWire::Sync(vec![9]).ttl_hint_secs(), 60);
-        // 倒挂容错（exp < iat ⇒ 0，不 panic）。
+        // Inverted-window tolerance (exp < iat ⇒ 0, no panic).
         let odd = TicketWire::Local(SignedTicket {
             iat: 2000,
             exp: 1000,
@@ -464,7 +529,8 @@ mod tests {
         assert_eq!(odd.ttl_hint_secs(), 0);
     }
 
-    /// 控制消息往返（PeerListPull 请求/响应——M7 契约锚点）。
+    /// Control-message round trip (PeerListPull request/response — the M7
+    /// contract anchor).
     #[test]
     fn ctrl_request_response_roundtrip() {
         let req = CtrlRequest::PeerListPull {
@@ -496,9 +562,12 @@ mod tests {
         assert_eq!(postcard::from_bytes::<CtrlResponse>(&bytes).unwrap(), err);
     }
 
-    /// 变体位纪律（append-only）：Err 之前为冻结区，PeerList 位于 Err 之后（尾部）——
-    /// postcard 按声明序编码判别位（编码首字节即判别位），插入/重排即全体变体改码的
-    /// 破坏性变更。会话态无持久字节，两端同源重编译即可。
+    /// Variant-slot discipline (append-only): everything before Err is the
+    /// frozen zone, PeerList sits after Err (at the tail) — postcard
+    /// encodes discriminants in declaration order (the first encoded byte
+    /// is the discriminant), so inserting/reordering is a breaking change
+    /// that re-codes every variant. Session state has no persisted bytes;
+    /// both ends just recompile from the same source.
     #[test]
     fn ctrl_response_variant_order_discipline() {
         let err = CtrlResponse::Err {
@@ -510,15 +579,16 @@ mod tests {
         let p = postcard::to_allocvec(&peers).unwrap();
         assert!(
             e[0] < p[0],
-            "Err 判别位 < PeerList（PeerList 在 Err 之后——追加位纪律）"
+            "Err discriminant < PeerList (PeerList after Err — append-only discipline)"
         );
         assert_eq!(
             p[0], 11,
-            "PeerList = 尾变体（12 变体，判别位 11）——新变体只允许其后追加"
+            "PeerList = tail variant (12 variants, discriminant 11) — new variants may only be appended after it"
         );
     }
 
-    /// key-bind canonical：hostname 变化 ⇒ 覆盖面变化（签名锚定 hostname，M7）。
+    /// key-bind canonical: a hostname change ⇒ coverage change (the
+    /// signature anchors the hostname, M7).
     #[test]
     fn keybind_canonical_covers_hostname() {
         let dev = |hn: &str| DevicePubs {
@@ -529,31 +599,34 @@ mod tests {
         let a = keybind_canonical(&[9; 16], "alice", &[3; 16], &dev("box"), &[4; 32]);
         let b = keybind_canonical(&[9; 16], "alice", &[3; 16], &dev("box2"), &[4; 32]);
         assert_ne!(a, b);
-        // 确定性。
+        // Deterministic.
         let c = keybind_canonical(&[9; 16], "alice", &[3; 16], &dev("box"), &[4; 32]);
         assert_eq!(a, c);
     }
 
-    /// hostname 规范化（与 flock-sync 同语义——上收不改行为）。
+    /// hostname normalization (same semantics as flock-sync — the lift-up
+    /// changes no behavior).
     #[test]
     fn hostname_normalize_semantics() {
         assert_eq!(normalize_hostname("  box-a \n"), "box-a");
         assert_eq!(normalize_hostname(""), HOSTNAME_UNKNOWN);
         assert_eq!(normalize_hostname("   "), HOSTNAME_UNKNOWN);
-        // 64B 截断。
+        // 64B truncation.
         let long = "x".repeat(80);
         assert_eq!(normalize_hostname(&long).len(), HOSTNAME_MAX);
-        // char 边界安全（多字节字符不劈开）。
-        let cjk = "群".repeat(30); // 90B
-        let n = normalize_hostname(&cjk);
-        assert_eq!(n.len(), 63, "63B = 21 个三字节字符（64 处劈半回退到边界）");
-        assert!(n.chars().all(|c| c == '群'));
+        // char-boundary safety (multibyte characters are not split).
+        let mbc = "€".repeat(30); // 90B
+        let n = normalize_hostname(&mbc);
+        assert_eq!(n.len(), 63, "63B = 21 three-byte characters (the 64B cut would split one, so it backs off to the boundary)");
+        assert!(n.chars().all(|c| c == '€'));
     }
 
-    /// 帧编解码回环（内存 futures-io：`[u32 LE len][postcard]` 与生产同路径）。
+    /// Frame-codec loopback (in-memory futures-io: `[u32 LE
+    /// len][postcard]` over the same path as production).
     #[tokio::test]
     async fn ctrl_frame_roundtrip_over_mem_io() {
-        /// 最小 futures-io 内存对象（写收集 → 读回放；测试专用，无并发面）。
+        /// Minimal in-memory futures-io object (write collects → read
+        /// replays; test-only, no concurrency surface).
         struct MemIo {
             buf: std::collections::VecDeque<u8>,
         }
@@ -605,12 +678,13 @@ mod tests {
         assert_eq!(req, CtrlRequest::PeerListPull { ticket: None });
         let got: CtrlResponse = recv_ctrl_msg(&mut io).await.unwrap();
         assert_eq!(got, resp);
-        // 帧头长度域：`len=0` 拒（防御位行为锚定）。
+        // Frame-header length field: `len=0` rejected (defensive-bit
+        // behavior anchor).
         io.buf.clear();
         io.buf.extend(0u32.to_le_bytes());
         assert!(
             recv_ctrl_msg::<_, CtrlRequest>(&mut io).await.is_err(),
-            "len=0 必须拒绝"
+            "len=0 must be rejected"
         );
     }
 }

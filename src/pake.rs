@@ -1,26 +1,42 @@
-//! OPAQUE 登录协议（**RFC 9807** / opaque-ke 4.0.1，§1.3.3h / §3.4，P2-11、P1-6）。
+//! OPAQUE login protocol (**RFC 9807** / opaque-ke 4.0.1, §1.3.3h / §3.4,
+//! P2-11, P1-6).
 //!
-//! - Suite 与 showroom 相同：Ristretto255（OPRF + KE）+ TripleDH + **Identity KSF**——
-//!   argon2id 硬化由 [`rwd`] 在盲化前外部承担（盐含 user），KSF 本体恒 Identity 以免双重
-//!   stretch（showroom-common opaque.rs:4-6 同语义；3.0.0→4.0.1 的 Suite 形状变化：
-//!   `KeGroup` 从 CipherSuite 移入 `KeyExchange = TripleDh<Ristretto255, Sha512>`，
-//!   组合不变——4.0.0 CHANGELOG「Synced implementation with RFC 9807 (no core protocol
-//!   changes)」，wire 格式不变由 tests/vectors/showroom-3.0.0.json 互通向量实证）。
-//! - RFC 引用勘误（P2-11）：showroom-common opaque.rs:1 误写 RFC 9380，本模块一律 **9807**。
-//! - 线上格式：所有报文（ke1/ke2/ke3/m1/m2/record）与落盘（`pass.opaque`/`opaque.key`）
-//!   一律 base64(标准字母表无 padding)——与 pub_string 的编码惯例一致。
-//! - rwd 参数化 profile（§1.3.3h）：[`Profile::Owasp19MiB`]（showroom 兼容默认：m=19456KiB,
-//!   t=2, p=1）/ [`Profile::Rfc9807High`]（m=2GiB, t=1, p=4 高配档）；**profile id 进注册记录
-//!   防跨档漂移**（调用方把 [`Profile::id`] 存进记录侧；两端不同 profile 登录必失败）。
-//! - `ServerSetup` 3.0.0→4.0.1 序列化布局变化（dummy 假钥匙 sk→pk，4.0.0 CHANGELOG）：
-//!   旧 `opaque.key` 由 [`server_setup_migrate_v3`] 迁移；`ServerRegistration` 布局不变，
-//!   3.0.0 注册记录直接 [`server_record_from_b64`] 读入（M1 守门向量实证）。
+//! - Same Suite as showroom: Ristretto255 (OPRF + KE) + TripleDH +
+//!   **Identity KSF** — argon2id hardening is applied externally by
+//!   [`rwd`] before blinding (salt includes the user); the KSF itself is
+//!   always Identity to avoid double stretching (same semantics as
+//!   showroom-common opaque.rs:4-6; Suite shape change 3.0.0→4.0.1:
+//!   `KeGroup` moved out of CipherSuite into `KeyExchange =
+//!   TripleDh<Ristretto255, Sha512>`, composition unchanged — 4.0.0
+//!   CHANGELOG "Synced implementation with RFC 9807 (no core protocol
+//!   changes)"; unchanged wire format proven by the interop vectors in
+//!   tests/vectors/showroom-3.0.0.json).
+//! - RFC citation erratum (P2-11): showroom-common opaque.rs:1
+//!   mis-cites RFC 9380; this module consistently says **9807**.
+//! - Wire format: every message (ke1/ke2/ke3/m1/m2/record) and persisted
+//!   form (`pass.opaque`/`opaque.key`) is base64 (standard alphabet,
+//!   unpadded) — consistent with the pub_string encoding convention.
+//! - Parameterized rwd profiles (§1.3.3h): [`Profile::Owasp19MiB`]
+//!   (showroom-compatible default: m=19456KiB, t=2, p=1) /
+//!   [`Profile::Rfc9807High`] (m=2GiB, t=1, p=4 high tier); **the profile
+//!   id goes into the registration record to prevent cross-tier drift**
+//!   (callers store [`Profile::id`] on the record side; mismatched
+//!   profiles between the two ends always fail the login).
+//! - `ServerSetup` 3.0.0→4.0.1 serialization layout change (dummy fake
+//!   key sk→pk, 4.0.0 CHANGELOG): old `opaque.key` is migrated by
+//!   [`server_setup_migrate_v3`]; the `ServerRegistration` layout is
+//!   unchanged, and 3.0.0 registration records load directly via
+//!   [`server_record_from_b64`] (proven by M1 gate vectors).
 //!
-//! 语义要点（与 showroom 相同，serve 侧调用方负责）：
-//! - 未知用户：`server_login_start` 的 record 传 `None` → crate 原生 dummy 假记录路径，
-//!   仍产出同形 ke2（防枚举；4.0.1 起恒造 dummy 记录以抗时序差，CHANGELOG）；
-//! - 错密码：客户端 `login_finish` 本地失败（Err），线上无差异；
-//! - credential_identifier=user、三方标识 client=user / server=[`SERVER_ID`]。
+//! Semantics notes (same as showroom; the serve-side caller owns these):
+//! - Unknown user: pass `None` as the record to `server_login_start` →
+//!   the crate's native dummy-record path, still producing a same-shape
+//!   ke2 (anti-enumeration; since 4.0.1 a dummy record is always created
+//!   to resist timing differences, CHANGELOG);
+//! - Wrong password: the client's `login_finish` fails locally (Err), no
+//!   wire-visible difference;
+//! - credential_identifier=user; three-party identifiers client=user /
+//!   server=[`SERVER_ID`].
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::engine::Engine as _;
@@ -33,15 +49,19 @@ use opaque_ke::{
     CredentialResponse, Identifiers, RegistrationRequest, RegistrationResponse, ServerLogin,
     ServerLoginParameters, ServerRegistration, ServerSetup,
 };
-use sha2_compat::Sha512; // opaque-ke 4.0.1 的 digest 0.10 代际
+use sha2_compat::Sha512; // opaque-ke 4.0.1's digest 0.10 generation
 
 use rand::TryCryptoRng as CryptoRngCore;
 
-/// rwd 盐 = b"showroom-opaque-v1" + user（showroom-common opaque.rs:53 原值；常数盐合法：
-/// 盲化已提供保护，硬化只为抬高离线字典代价；user 进盐使同密码不同账号派生不同 rwd）。
+/// rwd salt = b"showroom-opaque-v1" + user (showroom-common opaque.rs:53
+/// original value; a constant salt is legitimate: blinding already
+/// provides protection and hardening only raises the offline-dictionary
+/// cost; the user in the salt makes the same password derive different
+/// rwds across accounts).
 const RWD_SALT_PREFIX: &[u8] = b"showroom-opaque-v1";
 
-/// Suite：Ristretto255 + TripleDH(Sha512) + Identity KSF（argon2id 由 `rwd` 外部承担）。
+/// Suite: Ristretto255 + TripleDH(Sha512) + Identity KSF (argon2id applied
+/// externally by `rwd`).
 pub struct Suite;
 
 impl CipherSuite for Suite {
@@ -50,24 +70,30 @@ impl CipherSuite for Suite {
     type Ksf = Identity;
 }
 
-/// 三方标识中的服务端身份（KE transcript 域分离；两端一致即可）。showroom 兼容原值。
+/// The server identity among the three-party identifiers (KE transcript
+/// domain separation; only both-side agreement matters). Showroom
+/// compatibility original value.
 pub const SERVER_ID: &[u8] = b"showroom-server";
 
-/// 密码硬化的输出长度（OPAQUE 盲化输入宽度）。
+/// Output length of password hardening (the OPAQUE blinding input width).
 pub const RWD_LEN: usize = 32;
 
-/// argon2id 参数 profile（§1.3.3h：版本化升级不破老记录；profile id 进注册记录）。
+/// argon2id parameter profile (§1.3.3h: versioned upgrades do not break
+/// old records; the profile id goes into the registration record).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Profile {
-    /// showroom 兼容默认：argon2id m=19456KiB, t=2, p=1（OWASP 推荐档）。
+    /// showroom-compatible default: argon2id m=19456KiB, t=2, p=1 (OWASP
+    /// recommended tier).
     #[default]
     Owasp19MiB,
-    /// RFC 9807 高配档：m=2GiB, t=1, p=4（服务器级内存占用，慢但离线字典代价最高）。
+    /// RFC 9807 high tier: m=2GiB, t=1, p=4 (server-grade memory usage;
+    /// slow but the offline-dictionary cost is highest).
     Rfc9807High,
 }
 
 impl Profile {
-    /// 稳定 profile id（进注册记录，防跨档漂移；0 保留给 showroom 兼容默认）。
+    /// Stable profile id (goes into the registration record to prevent
+    /// cross-tier drift; 0 reserved for the showroom-compatible default).
     pub const fn id(self) -> u16 {
         match self {
             Profile::Owasp19MiB => 0,
@@ -80,16 +106,19 @@ impl Profile {
             Profile::Owasp19MiB => (19456, 2, 1),
             Profile::Rfc9807High => (2 * 1024 * 1024, 1, 4),
         };
-        argon2::Params::new(m_kib, t, p, Some(RWD_LEN)).expect("固定合法 argon2 参数")
+        argon2::Params::new(m_kib, t, p, Some(RWD_LEN)).expect("fixed valid argon2 parameters")
     }
 }
 
-/// 密码硬化的统一错误（argon2 参数构造在固定 profile 下不可能失败，仅透传哈希错误）。
+/// Uniform error for password hardening (argon2 parameter construction
+/// cannot fail under fixed profiles; only hash errors are propagated).
 pub type PakeResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// rwd（rotated password derivation）：argon2id(profile) → 32B，盐 = 前缀 ‖ user。
-/// 确定性函数（无秘密依赖）；与 showroom 3.0.0 的 `rwd` 在 [`Profile::Owasp19MiB`] 下
-/// 逐字节一致（由 tests/vectors/showroom-3.0.0.json 的 rwd_hex 断言实证）。
+/// rwd (rotated password derivation): argon2id(profile) → 32B, salt =
+/// prefix ‖ user. A deterministic function (no secret dependencies);
+/// byte-for-byte identical to showroom 3.0.0's `rwd` under
+/// [`Profile::Owasp19MiB`] (proven by the rwd_hex assertions in
+/// tests/vectors/showroom-3.0.0.json).
 pub fn rwd(pw: &str, user: &str, profile: Profile) -> PakeResult<[u8; RWD_LEN]> {
     let a2 = argon2::Argon2::new(
         argon2::Algorithm::Argon2id,
@@ -104,7 +133,7 @@ pub fn rwd(pw: &str, user: &str, profile: Profile) -> PakeResult<[u8; RWD_LEN]> 
     Ok(out)
 }
 
-// —— 小工具 ——
+// —— Small helpers ——
 
 fn ids(user: &str) -> Identifiers<'_> {
     Identifiers {
@@ -117,9 +146,11 @@ fn b64(bytes: &[u8]) -> String {
     STANDARD_NO_PAD.encode(bytes)
 }
 
-/// 未认证 b64 入口的尺寸上限（64KiB）：OPAQUE 全部报文（ke1/ke2/ke3/m1/m2/record）
-/// 与 `opaque.key`/`pass.opaque` 落盘形态都远小于此——超限在 decode 分配前拒绝，
-/// 防大报文放大分配（ke1 等服务端入口是未认证攻击面）。
+/// Size cap for unauthenticated b64 inputs (64KiB): all OPAQUE messages
+/// (ke1/ke2/ke3/m1/m2/record) and the persisted `opaque.key`/`pass.opaque`
+/// forms are far smaller — over-cap inputs are rejected before the decode
+/// allocation, preventing large-message amplification (server entrances
+/// like ke1 are an unauthenticated attack surface).
 const B64_INPUT_LIMIT: usize = 64 * 1024;
 
 fn unb64(s: &str) -> PakeResult<Vec<u8>> {
@@ -133,8 +164,9 @@ fn unb64(s: &str) -> PakeResult<Vec<u8>> {
     Ok(STANDARD_NO_PAD.decode(s.trim())?)
 }
 
-/// rand 0.9（本库 RNG 面）→ rand 0.8（opaque-ke 4.0.1 的 RNG 代际）私有桥。
-/// 熵源故障直接 panic（同本库 kem 模块桥的语义）。
+/// Private rand 0.9 (this library's RNG surface) → rand 0.8 (opaque-ke
+/// 4.0.1's RNG generation) bridge. Entropy-source failure panics directly
+/// (same semantics as this library's kem module bridge).
 struct RngBridge08<'a, R: rand::TryRngCore + ?Sized>(&'a mut R);
 
 fn bridge08<R: rand::TryRngCore + ?Sized>(rng: &mut R) -> RngBridge08<'_, R> {
@@ -164,13 +196,16 @@ impl<R: rand::TryRngCore + ?Sized> opaque_ke::rand::RngCore for RngBridge08<'_, 
     }
 }
 
-// rand 0.8 CryptoRng 为标记 trait
+// rand 0.8 CryptoRng is a marker trait
 impl<R: rand::TryRngCore + ?Sized> opaque_ke::rand::CryptoRng for RngBridge08<'_, R> {}
 
-// —— 客户端（CLI native 与 wasm 垫片共用；密码 → rwd → 盲化）——
+// —— Client (shared by the CLI native side and the wasm shim; password →
+// rwd → blinding) ——
 
-/// 登录第一步：产出 ke1（发 `/_api/auth/login-begin`）与待 finish 的本地状态。
-/// rwd 用 [`Profile::default`]（showroom 兼容档）；高配档走 [`login_start_profile`]。
+/// Login step 1: produce ke1 (sent to `/_api/auth/login-begin`) plus the
+/// local state awaiting finish. rwd uses [`Profile::default`]
+/// (showroom-compatible tier); for the high tier use
+/// [`login_start_profile`].
 pub fn login_start(
     rng: &mut impl CryptoRngCore,
     pw: &str,
@@ -179,7 +214,8 @@ pub fn login_start(
     login_start_profile(rng, pw, user, Profile::default())
 }
 
-/// [`login_start`] 的显式 profile 档（注册记录侧存了哪个 profile 就用哪个）。
+/// [`login_start`] with an explicit profile tier (use whichever profile
+/// the registration record stores).
 pub fn login_start_profile(
     rng: &mut impl CryptoRngCore,
     pw: &str,
@@ -192,7 +228,8 @@ pub fn login_start_profile(
     Ok((out.state, b64(&out.message.serialize())))
 }
 
-/// 登录第三步（本地）：ke2 → ke3。密码错误在此 Err（本地提示，不产生第三请求）。
+/// Login step 3 (local): ke2 → ke3. A wrong password errors here (local
+/// prompt; no third request is produced).
 pub fn login_finish(
     state: ClientLogin<Suite>,
     pw: &str,
@@ -202,7 +239,7 @@ pub fn login_finish(
     login_finish_profile(state, pw, user, ke2_b64, Profile::default())
 }
 
-/// [`login_finish`] 的显式 profile 档。
+/// [`login_finish`] with an explicit profile tier.
 pub fn login_finish_profile(
     state: ClientLogin<Suite>,
     pw: &str,
@@ -228,7 +265,8 @@ pub fn login_finish_profile(
     Ok(b64(&out.message.serialize()))
 }
 
-/// 注册第一步（改密码流程）：产出 m1（发 `/_api/auth/pw-begin`）与本地状态。
+/// Registration step 1 (password-change flow): produce m1 (sent to
+/// `/_api/auth/pw-begin`) plus local state.
 pub fn reg_start(
     rng: &mut impl CryptoRngCore,
     pw: &str,
@@ -237,7 +275,7 @@ pub fn reg_start(
     reg_start_profile(rng, pw, user, Profile::default())
 }
 
-/// [`reg_start`] 的显式 profile 档。
+/// [`reg_start`] with an explicit profile tier.
 pub fn reg_start_profile(
     rng: &mut impl CryptoRngCore,
     pw: &str,
@@ -250,7 +288,8 @@ pub fn reg_start_profile(
     Ok((out.state, b64(&out.message.serialize())))
 }
 
-/// 注册收尾（客户端）：m2 → record（发 `/_api/auth/pw-commit`；服务端原子替换）。
+/// Registration finish (client): m2 → record (sent to
+/// `/_api/auth/pw-commit`; atomically replaced server-side).
 pub fn reg_finish(
     rng: &mut impl CryptoRngCore,
     state: ClientRegistration<Suite>,
@@ -261,7 +300,7 @@ pub fn reg_finish(
     reg_finish_profile(rng, state, pw, user, m2_b64, Profile::default())
 }
 
-/// [`reg_finish`] 的显式 profile 档。
+/// [`reg_finish`] with an explicit profile tier.
 pub fn reg_finish_profile(
     rng: &mut impl CryptoRngCore,
     state: ClientRegistration<Suite>,
@@ -287,34 +326,43 @@ pub fn reg_finish_profile(
     Ok(b64(&out.message.serialize()))
 }
 
-// —— 服务端（showroomctl / 本仓服务端二进制；serve 与管理命令共用）——
+// —— Server (showroomctl / this repository's server binary; shared by
+// serve and admin commands) ——
 
-/// 生成服务端 OPRF key（返回 b64 串，即 `opaque.key` 落盘内容）。
+/// Generate the server OPRF key (returns the b64 string, i.e. the
+/// persisted content of `opaque.key`).
 pub fn server_setup_new(rng: &mut impl CryptoRngCore) -> String {
     b64(&ServerSetup::<Suite>::new(&mut bridge08(rng)).serialize())
 }
 
-/// 加载 4.0.1 代际的服务端 OPRF key（`opaque.key` 文件内容；3.0.0 旧文件走
-/// [`server_setup_migrate_v3`]）。
+/// Load a 4.0.1-generation server OPRF key (the contents of the
+/// `opaque.key` file; 3.0.0 legacy files go through
+/// [`server_setup_migrate_v3`]).
 pub fn server_setup_load(b64_key: &str) -> PakeResult<ServerSetup<Suite>> {
     Ok(ServerSetup::<Suite>::deserialize(&unb64(b64_key)?)
         .map_err(|e| format!("bad opaque.key (4.0.1): {e}"))?)
 }
 
-/// 序列化服务端 OPRF key（[`server_setup_new`] 的逆）：迁移/换档后落盘 `opaque.key`
-/// 用——**必须经本函数写回**（而非误删重建：OPRF seed 轮换会使全部 `pass.opaque`
-/// 注册记录失效）。
+/// Serialize the server OPRF key (inverse of [`server_setup_new`]): for
+/// writing `opaque.key` back after a migration/tier change — **it must be
+/// written back via this function** (not deleted and recreated: rotating
+/// the OPRF seed invalidates every `pass.opaque` registration record).
 pub fn server_setup_b64(setup: &ServerSetup<Suite>) -> String {
     b64(&setup.serialize())
 }
 
-/// **3.0.0 → 4.0.1 `ServerSetup` 迁移**（P1-6 升级路径；4.0.0 CHANGELOG：
-/// dummy 假钥匙由 sk 改存 pk，布局 `[seed 64][KE sk 32][dummy 32]` 不变、末 32B 换义）。
-/// 输入 showroom 3.0.0 的 `opaque.key` b64 内容，输出可 [`server_setup_load`] 语义的
-/// 4.0.1 `ServerSetup`。OPRF seed 与真实 KE sk 逐字节保留 ⇒ 既有注册记录全部继续可登录。
+/// **3.0.0 → 4.0.1 `ServerSetup` migration** (P1-6 upgrade path; 4.0.0
+/// CHANGELOG: the dummy fake key is now stored as pk instead of sk; the
+/// layout `[seed 64][KE sk 32][dummy 32]` is unchanged, only the last 32B
+/// change meaning). Input is the b64 contents of showroom 3.0.0's
+/// `opaque.key`; output is a 4.0.1 `ServerSetup` loadable via
+/// [`server_setup_load`] semantics. The OPRF seed and the real KE sk are
+/// preserved byte-for-byte ⇒ every existing registration record can still
+/// log in.
 pub fn server_setup_migrate_v3(b64_key_3_0: &str) -> PakeResult<ServerSetup<Suite>> {
     let old = unb64(b64_key_3_0)?;
-    // ristretto255 Suite 布局：seed(SHA-512 输出 64) + KE sk 32 + dummy 32 = 128B
+    // ristretto255 Suite layout: seed (SHA-512 output, 64) + KE sk 32 +
+    // dummy 32 = 128B
     const SEED_LEN: usize = 64;
     const SK_LEN: usize = 32;
     if old.len() != SEED_LEN + SK_LEN + SK_LEN {
@@ -334,7 +382,8 @@ pub fn server_setup_migrate_v3(b64_key_3_0: &str) -> PakeResult<ServerSetup<Suit
     ServerSetup::<Suite>::deserialize(&new_bytes).map_err(|e| format!("migrate: {e}").into())
 }
 
-/// 注册第二步（服务端）：m1 → m2。credential_identifier=user（OPRF 域分离）。
+/// Registration step 2 (server): m1 → m2. credential_identifier=user (OPRF
+/// domain separation).
 pub fn server_reg_start(
     setup: &ServerSetup<Suite>,
     m1_b64: &str,
@@ -347,15 +396,18 @@ pub fn server_reg_start(
     Ok(b64(&out.message.serialize()))
 }
 
-/// 注册落库（服务端）：record（b64）→ 规范化后的落盘内容（解码验证 + 重编码）。
+/// Registration persistence (server): record (b64) → canonicalized
+/// persisted contents (decode-verify + re-encode).
 pub fn server_reg_canonical(record_b64: &str) -> PakeResult<String> {
     let upload = unb64(record_b64)?;
     Ok(b64(&upload))
 }
 
-/// 注册记录（服务端）：由落盘 b64 构造（登录时喂 server_login_start）。
-/// **3.0.0 布局不变**（4.0.0 CHANGELOG：ServerRegistration 直接 deserialize）——
-/// showroom 既有 `pass.opaque` 无迁移直接读入（M1 守门向量实证）。
+/// Registration record (server): construct from the persisted b64 (fed to
+/// server_login_start at login time). **3.0.0 layout unchanged** (4.0.0
+/// CHANGELOG: ServerRegistration deserializes directly) — showroom's
+/// existing `pass.opaque` loads without migration (proven by M1 gate
+/// vectors).
 pub fn server_record_from_b64(record_b64: &str) -> PakeResult<ServerRegistration<Suite>> {
     Ok(
         ServerRegistration::<Suite>::deserialize(&unb64(record_b64)?)
@@ -363,8 +415,10 @@ pub fn server_record_from_b64(record_b64: &str) -> PakeResult<ServerRegistration
     )
 }
 
-/// 登录第二步（服务端）：ke1 → ke2 + 在途状态（内存保存，login-finish 消费）。
-/// record=None 走 crate 原生 dummy 假记录路径（未知用户/未设密码：ke2 同形，防枚举）。
+/// Login step 2 (server): ke1 → ke2 plus the in-flight state (kept in
+/// memory, consumed by login-finish). record=None takes the crate's native
+/// dummy-record path (unknown user / no password set: same-shape ke2,
+/// anti-enumeration).
 pub fn server_login_start(
     rng: &mut impl CryptoRngCore,
     setup: &ServerSetup<Suite>,
@@ -392,7 +446,8 @@ pub fn server_login_start(
     ))
 }
 
-/// 登录第三步（服务端）：ke3 验证（MAC）；Err = 密码错误/伪造 → 调用方按 E_AUTH 同体 404。
+/// Login step 3 (server): ke3 verification (MAC); Err = wrong
+/// password/forgery → the caller responds with an E_AUTH-equivalent 404.
 pub fn server_login_finish(state_bytes: &[u8], ke3_b64: &str) -> PakeResult<()> {
     let state = ServerLogin::<Suite>::deserialize(state_bytes)
         .map_err(|e| format!("bad pending login state: {e}"))?;
@@ -411,7 +466,8 @@ pub fn server_login_finish(state_bytes: &[u8], ke3_b64: &str) -> PakeResult<()> 
 }
 
 // ============================================================================
-// anchor：OPAQUE 登录的服务端身份签名层（§1.3.3f / §3.4，P0-5 登录锚）
+// anchor: the server-identity signing layer for OPAQUE login (§1.3.3f /
+// §3.4, P0-5 login anchor)
 // ============================================================================
 
 #[cfg(feature = "anchor")]
@@ -419,24 +475,30 @@ mod anchor {
     use super::{login_finish_profile, ClientLogin, PakeResult, Profile, Suite};
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
-    /// anchor 签名域分离标签。
+    /// anchor signature domain-separation label.
     pub const ANCHOR_LABEL: &[u8] = b"flock-protocol/pake/anchor/v1";
 
-    /// 客户端对 OPAQUE 登录的期望服务端身份（来自隧道层钉扎 ServerPin：
-    /// cluster_root_pub 背书的 entry.identity_pub / server_id）。
+    /// The client's expected server identity for OPAQUE login (from the
+    /// tunnel-layer pinned ServerPin: the entry.identity_pub /
+    /// server_id endorsed by cluster_root_pub).
     #[derive(Debug, Clone)]
     pub struct AnchorExpectation {
-        /// 期望服务器标识（16B）。
+        /// Expected server identifier (16B).
         pub server_id: [u8; 16],
-        /// 期望服务器身份 Ed25519 公钥（anchor 验签锚）。
+        /// Expected server identity Ed25519 public key (the anchor
+        /// verification anchor).
         pub identity_pub: VerifyingKey,
-        /// 登录会话的一次性绑定凭据（key-bind 消费；进 anchor 签名防截获重挂）。
+        /// One-time binding credential for the login session (consumed by
+        /// key-bind; goes into the anchor signature to prevent
+        /// interception-and-replay onto another session).
         pub bind_token: [u8; 16],
     }
 
-    /// anchor 签名覆盖的规范化字节：`ANCHOR_LABEL ‖ server_id ‖ user ‖ ke2_b64 ‖ bind_token`
-    /// （§1.3.3f：签名覆盖 SERVER_ID‖user‖ke2 transcript‖bind_token）。user 变长 ⇒ 前置
-    /// 长度域，防拼接歧义。
+    /// Canonical bytes covered by the anchor signature: `ANCHOR_LABEL ‖
+    /// server_id ‖ user ‖ ke2_b64 ‖ bind_token` (§1.3.3f: the signature
+    /// covers SERVER_ID‖user‖ke2 transcript‖bind_token). user is
+    /// variable-length ⇒ a length field precedes it, preventing splicing
+    /// ambiguity.
     pub fn anchor_canonical_bytes(
         server_id: &[u8; 16],
         user: &str,
@@ -454,7 +516,8 @@ mod anchor {
         v
     }
 
-    /// 服务端侧签发（服务器身份 Ed25519 密钥 = 隧道层 `ServerIdentity::identity`）。
+    /// Server-side issuance (the server identity Ed25519 key = the tunnel
+    /// layer's `ServerIdentity::identity`).
     pub fn anchor_sign(
         server_identity: &SigningKey,
         server_id: &[u8; 16],
@@ -467,10 +530,15 @@ mod anchor {
         ))
     }
 
-    /// 客户端侧 anchor 版 login-finish（§3.4 `login_finish_anchored`）：
-    /// ① 以期望身份（钉扎 ServerEntry）验 anchor 签名——不符即拒（RFC 9807 aPAKE 模型要求
-    /// 客户端持有已认证服务端身份；防「持 OPRF key 的伪服务器」对登录的静默替身）；
-    /// ② 通过后执行常规 [`super::login_finish_profile`]（ke3 产出；错密码本地 Err）。
+    /// Client-side anchor-flavored login-finish (§3.4
+    /// `login_finish_anchored`):
+    /// ① verify the anchor signature against the expected identity (the
+    /// pinned ServerEntry) — any mismatch is rejected (the RFC 9807 aPAKE
+    /// model requires the client to hold an authenticated server identity;
+    /// this prevents a "fake server holding the OPRF key" from silently
+    /// impersonating the login);
+    /// ② on success run the regular [`super::login_finish_profile`]
+    /// (produces ke3; a wrong password errors locally).
     pub fn login_finish_anchored(
         state: ClientLogin<Suite>,
         pw: &str,
@@ -495,7 +563,7 @@ mod anchor {
         use super::*;
         use rand::rngs::OsRng;
 
-        // 正向：注册→登录（anchor 验签）往返
+        // Positive: registration → login (anchor verification) round trip
         #[test]
         fn anchored_login_roundtrip() {
             let mut rng = OsRng;
@@ -507,7 +575,8 @@ mod anchor {
                     .unwrap();
             let rec = server_record_from_b64(&record).unwrap();
 
-            // 服务端身份（隧道层 ServerIdentity 的 identity 密钥）
+            // Server identity (the tunnel layer ServerIdentity's identity
+            // key)
             let srv_sk = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
             let server_id: [u8; 16] = rand::random();
             let bind_token: [u8; 16] = rand::random();
@@ -533,7 +602,8 @@ mod anchor {
             server_login_finish(&pending, &ke3).unwrap();
         }
 
-        // 负向：anchor 签名来自攻击者密钥（伪服务器）⇒ login_finish_anchored 拒绝（ke3 不产生）
+        // Negative: the anchor signature comes from an attacker's key
+        // (fake server) ⇒ login_finish_anchored rejects (no ke3 produced)
         #[test]
         fn anchored_login_rejects_forged_anchor() {
             let mut rng = OsRng;
@@ -557,7 +627,8 @@ mod anchor {
                 identity_pub: srv_sk.verifying_key(),
                 bind_token,
             };
-            // 攻击者密钥签的 anchor（伪服务器）⇒ 拒
+            // An anchor signed with the attacker's key (fake server) ⇒
+            // rejected
             let forged = anchor_sign(&attacker, &server_id, "carol", &ke2, &bind_token);
             assert!(login_finish_anchored(
                 lstate,
@@ -583,7 +654,9 @@ mod tests {
     use super::*;
     use rand::rngs::OsRng;
 
-    // 注册→登录往返（两端同 crate；record/setup 序列化跨进程语义，showroom 同款测试平移）
+    // Registration → login round trip (both ends in this crate;
+    // record/setup serialization is cross-process semantics, test ported
+    // from showroom's equivalent)
     #[test]
     fn registration_login_roundtrip() {
         let mut rng = OsRng;
@@ -595,7 +668,7 @@ mod tests {
         let record_b64 = server_reg_canonical(&record_b64).unwrap();
         let record = server_record_from_b64(&record_b64).unwrap();
 
-        // 正确密码：ke1 → ke2 → ke3 → 服务端验证通过
+        // Correct password: ke1 → ke2 → ke3 → server verification passes
         let (lstate, ke1) = login_start(&mut rng, "hunter2", "alice").unwrap();
         let (ke2, sstate) =
             server_login_start(&mut rng, &setup, Some(&record), &ke1, "alice").unwrap();
@@ -603,7 +676,8 @@ mod tests {
         assert!(server_login_finish(&sstate, &ke3).is_ok());
     }
 
-    // 错密码：客户端本地 finish 即失败（不产生第三请求）
+    // Wrong password: the client's local finish fails (no third request
+    // produced)
     #[test]
     fn wrong_password_fails_client_finish() {
         let mut rng = OsRng;
@@ -619,7 +693,8 @@ mod tests {
         assert!(login_finish(lstate, "wrong-pw", "alice", &ke2).is_err());
     }
 
-    // 未知用户：record=None 仍产出 ke2（防枚举同形），客户端 finish 失败
+    // Unknown user: record=None still produces a ke2 (same shape,
+    // anti-enumeration); the client's finish fails
     #[test]
     fn unknown_user_dummy_path() {
         let mut rng = OsRng;
@@ -630,19 +705,21 @@ mod tests {
         assert!(login_finish(lstate, "whatever", "ghost", &ke2).is_err());
     }
 
-    // profile：Owasp19MiB 与 Rfc9807High 输出不同且各自确定；跨档必不匹配（防漂移语义）
+    // Profiles: Owasp19MiB and Rfc9807High outputs differ and are each
+    // deterministic; cross-tier never matches (anti-drift semantics)
     #[test]
     fn rwd_profiles_deterministic_and_distinct() {
         let a1 = rwd("pw", "alice", Profile::Owasp19MiB).unwrap();
         let a2 = rwd("pw", "alice", Profile::Owasp19MiB).unwrap();
-        assert_eq!(a1, a2, "同 profile 确定");
+        assert_eq!(a1, a2, "deterministic within the same profile");
         let b = rwd("pw", "alice", Profile::Rfc9807High).unwrap();
         assert_ne!(
             a1.to_vec(),
             b.to_vec(),
-            "不同 profile 输出必不同（跨档漂移即登录失败）"
+            "different profiles must produce different outputs (cross-tier drift means login failure)"
         );
-        // user 进盐：同密码不同账号派生不同
+        // user goes into the salt: the same password derives differently
+        // across accounts
         let c = rwd("pw", "bob", Profile::Owasp19MiB).unwrap();
         assert_ne!(a1.to_vec(), c.to_vec());
         assert_eq!(Profile::default(), Profile::Owasp19MiB);
@@ -650,7 +727,8 @@ mod tests {
         assert_eq!(Profile::Rfc9807High.id(), 1);
     }
 
-    // 高配档全流程：注册与登录都用 Rfc9807High（注意 argon2 m=2GiB：CI/低内存机较慢）
+    // High-tier full flow: both registration and login use Rfc9807High
+    // (note argon2 m=2GiB: slow on CI/low-memory machines)
     #[test]
     fn rfc9807_high_profile_end_to_end() {
         let mut rng = OsRng;
@@ -677,43 +755,54 @@ mod tests {
         assert!(server_login_finish(&sstate, &ke3).is_ok());
     }
 
-    // ServerSetup 迁移自洽：4.0.1 新 setup 不需要迁移；迁移函数对 4.0.1 布局应报错（长度同 128B
-    // 但 dummy 段是 pk——from_private_key_slice 把 pk 当标量重导出仍产 32B，故长度检查过，
-    // 真正的判别靠登录失败；此处仅验证迁移对 3.0.0 布局可工作 → 互通测试覆盖）
+    // ServerSetup migration self-consistency: a fresh 4.0.1 setup needs no
+    // migration; the migration function should error on the 4.0.1 layout
+    // (same 128B length but the dummy segment is a pk —
+    // from_private_key_slice re-exports the pk as a scalar and still yields
+    // 32B, so the length check passes; the real discriminator is login
+    // failure; here we only verify the migration works for the 3.0.0
+    // layout → covered by interop tests)
     #[test]
     fn migrate_rejects_wrong_length() {
         assert!(
             server_setup_migrate_v3("AAAA").is_err(),
-            "长度非 128B 必须拒绝"
+            "non-128B length must be rejected"
         );
     }
 
-    // 未认证 b64 入口的 64KiB 上限：server_login_start/server_reg_start 等服务端入口
-    // 在 decode 分配前拒绝超大报文（OPAQUE 报文远小于此）。
+    // 64KiB cap on unauthenticated b64 entrances: server entrances like
+    // server_login_start/server_reg_start reject oversized messages before
+    // the decode allocation (OPAQUE messages are far smaller).
     #[test]
     fn unb64_rejects_oversized_input() {
         let mut rng = rand::rng();
         let setup = server_setup_load(&server_setup_new(&mut rng)).unwrap();
         let huge = "A".repeat(64 * 1024 + 1);
-        // ke1 入口（未认证服务端面）
+        // ke1 entrance (unauthenticated server surface)
         assert!(
             server_login_start(&mut rng, &setup, None, &huge, "alice").is_err(),
-            "超限 ke1 必须在 decode 前拒绝"
+            "an over-cap ke1 must be rejected before decode"
         );
-        // m1 入口（未认证服务端面）
+        // m1 entrance (unauthenticated server surface)
         assert!(
             server_reg_start(&setup, &huge, "alice").is_err(),
-            "超限 m1 必须在 decode 前拒绝"
+            "an over-cap m1 must be rejected before decode"
         );
     }
 
-    // server_setup_b64 往返：new→b64→load 与 migrate_v3→b64→load 均逐字节还原
-    // （迁移后落盘新格式的写回路径——误删重建会使 OPRF seed 轮换、全部记录失效）
+    // server_setup_b64 round trip: new→b64→load and migrate_v3→b64→load
+    // both restore byte-for-byte (the write-back path for persisting the
+    // new format after migration — deleting and recreating would rotate
+    // the OPRF seed and invalidate every record)
     #[test]
     fn setup_b64_roundtrip() {
         let mut rng = rand::rng();
         let s1 = server_setup_load(&server_setup_new(&mut rng)).unwrap();
-        assert_eq!(server_setup_b64(&s1), server_setup_b64(&s1), "确定性序列化");
+        assert_eq!(
+            server_setup_b64(&s1),
+            server_setup_b64(&s1),
+            "deterministic serialization"
+        );
         let s2 = server_setup_load(&server_setup_b64(&s1)).unwrap();
         assert_eq!(server_setup_b64(&s2), server_setup_b64(&s1));
 

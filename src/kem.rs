@@ -1,18 +1,25 @@
-//! 混合 KEM：X25519 + ML-KEM-768（docs/design.md §1.3.3a / §3.1，P0-1、P0-7）。
+//! Hybrid KEM: X25519 + ML-KEM-768 (docs/design.md §1.3.3a / §3.1, P0-1,
+//! P0-7).
 //!
-//! 组合规则：`shared = HKDF-SHA256(x25519_ss ‖ ml_kem_ss)`（TLS 混合思想，RFC 10024；
-//! 设计依据 verdict §3.3 复核轮实跑：ek=1184B/ct=1088B、混合密文 1120B、混合公钥 1216B）。
-//! 实现用 ml-kem 0.3.3（纯 Rust FIPS 203）+ x25519-dalek 3.0.0，不用 liboqs（crypto-2026 §5）。
+//! Combination rule: `shared = HKDF-SHA256(x25519_ss ‖ ml_kem_ss)` (the TLS
+//! hybrid idea, RFC 10024; design basis verdict §3.3 review-round live
+//! runs: ek=1184B/ct=1088B, hybrid ciphertext 1120B, hybrid public key
+//! 1216B). Implemented with ml-kem 0.3.3 (pure-Rust FIPS 203) +
+//! x25519-dalek 3.0.0; liboqs is not used (crypto-2026 §5).
 //!
-//! 线上尺寸常量：
-//! - [`HybridPubkey`]：1216B = 32(X25519) ‖ 1184(ML-KEM-768 ek)；
-//! - [`HybridCt`]：1120B = 32(临时 X25519 公钥) ‖ 1088(ML-KEM-768 ct)。
+//! Wire-size constants:
+//! - [`HybridPubkey`]: 1216B = 32(X25519) ‖ 1184(ML-KEM-768 ek);
+//! - [`HybridCt`]: 1120B = 32(ephemeral X25519 public key) ‖ 1088(ML-KEM-768
+//!   ct).
 //!
-//! HKDF 参数（本库钉死，双方一致即逐字节确定）：salt=None（HKDF 零填充），
-//! info=`flock-protocol/hybrid-kem/x25519+ml-kem-768/v1`，OKM=32B。
+//! HKDF parameters (pinned by this library; agreement between both sides
+//! makes them byte-for-byte deterministic): salt=None (HKDF zero padding),
+//! info=`flock-protocol/hybrid-kem/x25519+ml-kem-768/v1`, OKM=32B.
 //!
-//! RNG 面：公开函数接受 rand 0.9 的 `TryCryptoRng`（OsRng / StdRng 直接可传）；
-//! ml-kem / x25519-dalek 3.0 内部走 rand_core 0.10 代际，由私有 [`RngBridge`] 桥接，调用方无感。
+//! RNG surface: public functions accept rand 0.9's `TryCryptoRng` (OsRng /
+//! StdRng can be passed directly); ml-kem / x25519-dalek 3.0 internally use
+//! the rand_core 0.10 generation, bridged by the private [`RngBridge`],
+//! invisibly to callers.
 
 use core::convert::Infallible;
 use core::fmt;
@@ -25,38 +32,43 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use zeroize::Zeroize as _;
 
-/// rand_core 0.10（ml-kem / x25519-dalek 3.0 的 RNG 代际）。仅库内桥接用，非公开 API 面。
+/// rand_core 0.10 (the RNG generation of ml-kem / x25519-dalek 3.0).
+/// Library-internal bridging only; not part of the public API surface.
 use rand_core as rc010;
 
-/// X25519 公钥线上长度（字节）。
+/// Wire length of an X25519 public key (bytes).
 pub const X25519_PUB_LEN: usize = 32;
-/// ML-KEM-768 封装公钥线上长度（FIPS 203：ek=1184B）。
+/// Wire length of an ML-KEM-768 encapsulation key (FIPS 203: ek=1184B).
 pub const ML_KEM_EK_LEN: usize = 1184;
-/// ML-KEM-768 密文长度（FIPS 203：ct=1088B）。
+/// ML-KEM-768 ciphertext length (FIPS 203: ct=1088B).
 pub const ML_KEM_CT_LEN: usize = 1088;
-/// 混合公钥线上长度：32 + 1184 = 1216B。
+/// Hybrid public key wire length: 32 + 1184 = 1216B.
 pub const HYBRID_PUB_LEN: usize = X25519_PUB_LEN + ML_KEM_EK_LEN;
-/// 混合密文长度：32 + 1088 = 1120B。
+/// Hybrid ciphertext length: 32 + 1088 = 1120B.
 pub const HYBRID_CT_LEN: usize = X25519_PUB_LEN + ML_KEM_CT_LEN;
-/// 混合共享密钥长度（HKDF-SHA256 OKM）。
+/// Hybrid shared secret length (HKDF-SHA256 OKM).
 pub const SHARED_LEN: usize = 32;
-/// 私钥序列化长度：32(X25519 sk) + 64(ML-KEM seed d‖z) = 96B。
+/// Secret key serialization length: 32(X25519 sk) + 64(ML-KEM seed d‖z) =
+/// 96B.
 pub const HYBRID_SK_LEN: usize = X25519_PUB_LEN + 64;
 
-/// HKDF info 标签：域分离（换算法/换组合规则必须换标签）。
+/// HKDF info label: domain separation (changing the algorithm or the
+/// combination rule requires changing the label).
 const HKDF_INFO: &[u8] = b"flock-protocol/hybrid-kem/x25519+ml-kem-768/v1";
 
-/// seed_material 的 z 重派生标签（域分离：z 仅用于 FIPS 203 隐式拒绝伪钥）。
+/// Re-derivation label for seed_material's z (domain separation: z is used
+/// only for FIPS 203 implicit rejection of bogus ciphertexts).
 const L_SEED_Z: &[u8] = b"flock-protocol/hybrid-kem/seed-z/v1";
 
-/// KEM 错误：公钥/密文反序列化或校验失败。
+/// KEM error: public key/ciphertext deserialization or validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KemError {
-    /// 混合公钥不合法（长度错或 ML-KEM ek 未过 FIPS 203 校验）。
+    /// Malformed hybrid public key (wrong length, or ML-KEM ek failed FIPS
+    /// 203 validation).
     InvalidPubkey,
-    /// 混合密文长度不合法。
+    /// Malformed hybrid ciphertext length.
     InvalidCiphertext,
-    /// 私钥种子长度不合法。
+    /// Malformed secret key seed length.
     InvalidSecret,
 }
 
@@ -72,17 +84,21 @@ impl fmt::Display for KemError {
 
 impl std::error::Error for KemError {}
 
-/// 混合共享密钥（HKDF-SHA256 合流后的 32B OKM）。
-/// 可直接作 AES-256 钥匙（信封 v2 即此用法，§1.3.3b）。
+/// Hybrid shared secret (the 32B OKM after HKDF-SHA256 confluence).
+/// Usable directly as an AES-256 key (envelope v2 does exactly this,
+/// §1.3.3b).
 ///
-/// 秘密材料纪律（§1.3.3c 清零承诺）：**不实现 `Copy`**（防按值复制扩散密钥字节的
-/// 无意路径，按引用传递/显式 `clone` 不受影响）；Drop 时显式清零
-/// （[`zeroize::Zeroize`]，与 [`SealedShared::zeroize`] 同一实现）。
+/// Secret-material discipline (§1.3.3c zeroization commitment): **`Copy`
+/// is deliberately not implemented** (blocking accidental paths that copy
+/// key bytes by value; by-reference passing and explicit `clone` are
+/// unaffected); zeroized explicitly on Drop ([`zeroize::Zeroize`], the same
+/// implementation as [`SealedShared::zeroize`]).
 #[derive(Clone, PartialEq, Eq)]
 pub struct SealedShared([u8; SHARED_LEN]);
 
 impl SealedShared {
-    /// 原始 32B（调用方负责用途域分离；跨用途派生请另走 HKDF）。
+    /// Raw 32B (the caller is responsible for usage domain separation; use
+    /// a separate HKDF pass for cross-purpose derivation).
     pub fn as_bytes(&self) -> &[u8; SHARED_LEN] {
         &self.0
     }
@@ -102,22 +118,23 @@ impl Drop for SealedShared {
 
 impl fmt::Debug for SealedShared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // 不泄露密钥内容
+        // Do not leak key contents
         f.write_str("SealedShared(***)")
     }
 }
 
-/// 混合密钥对：X25519 静态 + ML-KEM-768 解封装钥。
+/// Hybrid keypair: X25519 static + ML-KEM-768 decapsulation key.
 ///
-/// 序列化（[`HybridKeypair::to_bytes`]）= 32B X25519 私钥 ‖ 64B ML-KEM seed（d‖z），
-/// 私钥文件按 0600 落盘由调用方负责。
+/// Serialization ([`HybridKeypair::to_bytes`]) = 32B X25519 secret key ‖ 64B
+/// ML-KEM seed (d‖z); persisting the secret key file with 0600 is the
+/// caller's responsibility.
 pub struct HybridKeypair {
     x25519: StaticSecret,
     ml_kem: DecapsulationKey<MlKem768>,
 }
 
 impl HybridKeypair {
-    /// 生成新混合密钥对（随机性全部来自 `rng`）。
+    /// Generate a new hybrid keypair (all randomness drawn from `rng`).
     pub fn generate(rng: &mut impl rand::TryCryptoRng) -> Self {
         let x = StaticSecret::random_from_rng(&mut bridge(rng));
         let dk = MlKem768::generate_keypair_from_rng(&mut bridge(rng)).0;
@@ -127,7 +144,7 @@ impl HybridKeypair {
         }
     }
 
-    /// 由 [`HybridKeypair::to_bytes`] 的 96B 恢复。
+    /// Restore from the 96B produced by [`HybridKeypair::to_bytes`].
     pub fn from_bytes(bytes: &[u8; HYBRID_SK_LEN]) -> Result<Self, KemError> {
         let (x, seed) = bytes.split_at(X25519_PUB_LEN);
         let x: [u8; 32] = x.try_into().expect("96B split");
@@ -138,7 +155,8 @@ impl HybridKeypair {
         })
     }
 
-    /// 96B 序列化（32B X25519 sk ‖ 64B ML-KEM seed）。密钥材料，注意落盘权限。
+    /// 96B serialization (32B X25519 sk ‖ 64B ML-KEM seed). Key material —
+    /// mind the on-disk permissions.
     pub fn to_bytes(&self) -> [u8; HYBRID_SK_LEN] {
         let mut out = [0u8; HYBRID_SK_LEN];
         out[..32].copy_from_slice(&self.x25519.to_bytes());
@@ -146,7 +164,7 @@ impl HybridKeypair {
         out
     }
 
-    /// 对应混合公钥（1216B）。
+    /// The corresponding hybrid public key (1216B).
     pub fn public(&self) -> HybridPubkey {
         let mut bytes = [0u8; HYBRID_PUB_LEN];
         let x_pub = PublicKey::from(&self.x25519);
@@ -159,31 +177,46 @@ impl HybridKeypair {
         }
     }
 
-    /// 静态 X25519 私钥引用。session 握手的 split 模式（§1.3.3c：X25519(e,s_srv) 与
-    /// ML-KEM ct 分列）需要单独取 X25519 份额做 DH，故开放只读访问。
+    /// Reference to the static X25519 secret key. The session handshake's
+    /// split mode (§1.3.3c: X25519(e,s_srv) and ML-KEM ct carried
+    /// separately) needs to take the X25519 share alone for DH, hence the
+    /// read-only access.
     ///
-    /// **将收敛**（flock-sync 迁移的后续阶段）：split 模式的取用面将统一到
-    /// [`HybridKeypair::seed_material`]/[`HybridKeypair::from_seed_material`] 与
-    /// 握手内部化；本访问器在此期间保持 `pub` 不动以保兼容过渡。
+    /// **Will converge** (later phase of the flock-sync migration): the
+    /// access surface for the split mode will be unified onto
+    /// [`HybridKeypair::seed_material`]/
+    /// [`HybridKeypair::from_seed_material`] with the handshake
+    /// internalized; this accessor stays `pub` unchanged in the interim to
+    /// keep the transition compatible.
     pub fn x25519_secret(&self) -> &StaticSecret {
         &self.x25519
     }
 
-    /// ML-KEM-768 解封装钥引用（同上，split 模式直取；**将收敛**——见
-    /// [`HybridKeypair::x25519_secret`] 的收敛注记）。
+    /// Reference to the ML-KEM-768 decapsulation key (as above, direct
+    /// access for the split mode; **will converge** — see the convergence
+    /// note on [`HybridKeypair::x25519_secret`]).
     pub fn ml_kem_decapsulation(&self) -> &DecapsulationKey<MlKem768> {
         &self.ml_kem
     }
 
-    /// split 模式种子材料（64B = X25519 私钥 32B ‖ ML-KEM d 32B）。
+    /// Split-mode seed material (64B = X25519 secret key 32B ‖ ML-KEM d
+    /// 32B).
     ///
-    /// **split 模式专用**（§1.3.3c：握手按 X25519(e,s_srv) 与 ML-KEM ct 分列使用
-    /// 服务器静态混合钥）：flock-sync 的静态密钥分发/迁移以本 64B 为载体（完整 96B
-    /// 私钥序列化仍是 [`HybridKeypair::to_bytes`]——含 ML-KEM z 的全量形态）。
+    /// **Split mode only** (§1.3.3c: the handshake uses the server's static
+    /// hybrid key with X25519(e,s_srv) and ML-KEM ct carried separately):
+    /// flock-sync's static key distribution/migration uses these 64B as the
+    /// carrier (the full 96B secret key serialization remains
+    /// [`HybridKeypair::to_bytes`] — the complete form including ML-KEM's
+    /// z).
     ///
-    /// 往返语义：[`HybridKeypair::from_seed_material`] 消费本产物得到**等效**密钥对——
-    /// 公钥逐字节一致、合法密文解封逐字节一致；ML-KEM 的 z（FIPS 203 中仅参与隐式
-    /// 拒绝伪钥，不进公钥与合法解封路径）由种子确定性重派生，与原钥的随机 z 不同。
+    /// Round-trip semantics: [`HybridKeypair::from_seed_material`]
+    /// consuming this output yields an **equivalent** keypair — public key
+    /// byte-for-byte identical, decapsulation of legitimate ciphertexts
+    /// byte-for-byte identical; ML-KEM's z (which in FIPS 203 participates
+    /// only in implicit rejection of bogus ciphertexts and never enters the
+    /// public key or the legitimate decapsulation path) is re-derived
+    /// deterministically from the seed, differing from the original key's
+    /// random z.
     pub fn seed_material(&self) -> [u8; 64] {
         let mut out = [0u8; 64];
         out[..32].copy_from_slice(&self.x25519.to_bytes());
@@ -192,12 +225,15 @@ impl HybridKeypair {
         out
     }
 
-    /// [`HybridKeypair::seed_material`] 的逆（等效密钥对语义见其文档）。确定性：
-    /// 同种子恒重建同一密钥对。
+    /// Inverse of [`HybridKeypair::seed_material`] (see its docs for the
+    /// equivalent-keypair semantics). Deterministic: the same seed always
+    /// rebuilds the same keypair.
     pub fn from_seed_material(seed: &[u8; 64]) -> Self {
         let x: [u8; 32] = seed[..32].try_into().expect("64B seed split");
         let d: [u8; 32] = seed[32..].try_into().expect("64B seed split");
-        // z 确定性重派生（域分离标签）：合法路径（公钥、合法密文解封）完全由 d 决定。
+        // Deterministic re-derivation of z (domain separation label): the
+        // legitimate paths (public key, decapsulation of legitimate
+        // ciphertexts) are determined entirely by d.
         let mut h = Sha256::new();
         h.update(L_SEED_Z);
         h.update(seed);
@@ -220,10 +256,10 @@ impl fmt::Debug for HybridKeypair {
     }
 }
 
-/// 混合公钥：线上 1216B = 32(X25519) ‖ 1184(ML-KEM-768 ek)。
+/// Hybrid public key: 1216B on the wire = 32(X25519) ‖ 1184(ML-KEM-768 ek).
 ///
-/// [`HybridPubkey::from_bytes`] 会走 FIPS 203 ek 校验（ml-kem `EncapsulationKey::new`），
-/// 拒绝畸形公钥。
+/// [`HybridPubkey::from_bytes`] runs the FIPS 203 ek validation (ml-kem
+/// `EncapsulationKey::new`) and rejects malformed public keys.
 #[derive(Clone)]
 pub struct HybridPubkey {
     x25519: PublicKey,
@@ -232,14 +268,16 @@ pub struct HybridPubkey {
 }
 
 impl HybridPubkey {
-    /// 从线上 1216B 恢复（含 ML-KEM ek 结构校验）。
+    /// Restore from the 1216 wire bytes (including ML-KEM ek structural
+    /// validation).
     pub fn from_bytes(bytes: &[u8; HYBRID_PUB_LEN]) -> Result<Self, KemError> {
         let (x, ek) = bytes.split_at(X25519_PUB_LEN);
         let ek_arr: [u8; ML_KEM_EK_LEN] = ek.try_into().expect("1216B split");
         let key = Key::<EncapsulationKey<MlKem768>>::try_from(ek_arr.as_slice()).expect("1184B ek");
         let ml_kem =
             EncapsulationKey::<MlKem768>::new(&key).map_err(|_| KemError::InvalidPubkey)?;
-        // X25519 公钥任意 32B 均可（小阶点在 diffie_hellman 后由 was_contributory 兜底）
+        // Any 32B is a valid X25519 public key (low-order points are caught
+        // after diffie_hellman by the was_contributory backstop)
         let x_arr: [u8; X25519_PUB_LEN] = x.try_into().expect("1216B split");
         Ok(HybridPubkey {
             x25519: PublicKey::from(x_arr),
@@ -248,17 +286,20 @@ impl HybridPubkey {
         })
     }
 
-    /// 线上 1216B（规范化布局，直接可发）。
+    /// The 1216 wire bytes (canonical layout, directly sendable).
     pub fn to_bytes(&self) -> [u8; HYBRID_PUB_LEN] {
         self.bytes
     }
 
-    /// X25519 公钥部分（1216B 的前 32B 对应物）。session 握手 split 模式用（§1.3.3c）。
+    /// The X25519 public key portion (the counterpart of the first 32B of
+    /// the 1216B). Used by the session handshake split mode (§1.3.3c).
     pub fn x25519_public(&self) -> &PublicKey {
         &self.x25519
     }
 
-    /// ML-KEM-768 封装公钥部分。session 握手对服务器静态 ML-KEM 公钥封装 1088B ct 用。
+    /// The ML-KEM-768 encapsulation key portion. Used by the session
+    /// handshake to encapsulate a 1088B ct against the server's static
+    /// ML-KEM public key.
     pub fn ml_kem_encapsulation(&self) -> &EncapsulationKey<MlKem768> {
         &self.ml_kem
     }
@@ -274,17 +315,19 @@ impl fmt::Debug for HybridPubkey {
     }
 }
 
-/// 混合密文：1120B = 32(临时 X25519 公钥) ‖ 1088(ML-KEM-768 ct)。
+/// Hybrid ciphertext: 1120B = 32(ephemeral X25519 public key) ‖
+/// 1088(ML-KEM-768 ct).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct HybridCt([u8; HYBRID_CT_LEN]);
 
 impl HybridCt {
-    /// 从线上 1120B 恢复（仅查长度；ML-KEM ct 任意 1088B 均为合法输入——隐式拒绝语义）。
+    /// Restore from the 1120 wire bytes (length check only; any 1088B is
+    /// legitimate ML-KEM ct input — implicit rejection semantics).
     pub fn from_bytes(bytes: &[u8; HYBRID_CT_LEN]) -> Self {
         HybridCt(*bytes)
     }
 
-    /// 线上 1120B。
+    /// The 1120 wire bytes.
     pub fn to_bytes(&self) -> [u8; HYBRID_CT_LEN] {
         self.0
     }
@@ -296,26 +339,30 @@ impl fmt::Debug for HybridCt {
     }
 }
 
-/// 公钥指纹：SHA-256(1216B 规范化公钥)。钉扎/展示用（§3.8 展示格式 = 8 组 hex）。
+/// Public key fingerprint: SHA-256(1216B canonical public key). For pinning
+/// and display (§3.8 display format = 8 hex groups).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Fingerprint([u8; 32]);
 
 impl Fingerprint {
-    /// 由既有 32B 摘要构造（session 侧对集群根/身份 Ed25519 公钥的指纹复用同一展示格式）。
+    /// Construct from an existing 32B digest (the session side reuses the
+    /// same display format for fingerprints of cluster-root/identity
+    /// Ed25519 public keys).
     pub fn from_digest(bytes: [u8; 32]) -> Self {
         Fingerprint(bytes)
     }
 }
 
 impl Fingerprint {
-    /// 原始 32B。
+    /// Raw 32B.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
 
 impl fmt::Display for Fingerprint {
-    /// 展示格式：8 组 8 hex 字符，冒号分隔（§3.8「8 组 hex」钉扎展示约定）。
+    /// Display format: 8 groups of 8 hex characters, colon-separated (§3.8
+    /// "8 hex groups" pinning display convention).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let hexs = hex::encode(self.0);
         for i in 0..8 {
@@ -334,9 +381,12 @@ impl fmt::Debug for Fingerprint {
     }
 }
 
-/// 封装：对 `pk` 生成一次性共享密钥与混合密文（随机性全部来自 `rng`）。
+/// Encapsulation: produce a one-time shared secret and hybrid ciphertext
+/// for `pk` (all randomness drawn from `rng`).
 ///
-/// 一次性信封/握手共享的正确打开方式：每信封/每握手调用一次，`SealedShared` 用后即弃。
+/// The correct way to use this for one-time envelope/handshake sharing:
+/// call once per envelope/handshake and discard the `SealedShared` after
+/// use.
 pub fn encapsulate(
     pk: &HybridPubkey,
     rng: &mut impl rand::TryCryptoRng,
@@ -354,8 +404,10 @@ pub fn encapsulate(
     (shared, HybridCt(ct_bytes))
 }
 
-/// 解封装。`None` 仅当 X25519 侧非贡献（小阶点攻击面；正常流量不会出现）——
-/// ML-KEM 侧按 FIPS 203 隐式拒绝返回伪随机钥匙，由上层 AEAD 认证兜底。
+/// Decapsulation. `None` only when the X25519 side is non-contributory
+/// (small-subgroup attack surface; never occurs in honest traffic) — the
+/// ML-KEM side returns a pseudo-random key per FIPS 203 implicit rejection,
+/// backstopped by the upper-layer AEAD authentication.
 pub fn decapsulate(sk: &HybridKeypair, ct: &HybridCt) -> Option<SealedShared> {
     let (eph, ml_ct) = ct.0.split_at(X25519_PUB_LEN);
     let eph_arr: [u8; X25519_PUB_LEN] = eph.try_into().expect("1120B split");
@@ -369,13 +421,14 @@ pub fn decapsulate(sk: &HybridKeypair, ct: &HybridCt) -> Option<SealedShared> {
     Some(combine(x_ss.as_bytes(), ml_ss.as_slice()))
 }
 
-/// 公钥指纹（SHA-256 over 1216B 规范化公钥）。
+/// Public key fingerprint (SHA-256 over the 1216B canonical public key).
 pub fn fingerprint(pk: &HybridPubkey) -> Fingerprint {
     Fingerprint(Sha256::digest(pk.to_bytes()).into())
 }
 
-/// HKDF-SHA256 合流：ikm = x25519_ss ‖ ml_kem_ss（顺序固定，§1.3.3a）。
-/// ikm 是双份共享秘密的拼接——`Zeroizing` 包裹，Drop 时清零（§1.3.3c 密钥纪律）。
+/// HKDF-SHA256 confluence: ikm = x25519_ss ‖ ml_kem_ss (fixed order,
+/// §1.3.3a). The ikm is the concatenation of both shared secrets — wrapped
+/// in `Zeroizing`, zeroized on Drop (§1.3.3c key discipline).
 fn combine(x_ss: &[u8], ml_ss: &[u8]) -> SealedShared {
     use hkdf::Hkdf;
     let mut ikm = zeroize::Zeroizing::new(Vec::with_capacity(x_ss.len() + ml_ss.len()));
@@ -383,13 +436,15 @@ fn combine(x_ss: &[u8], ml_ss: &[u8]) -> SealedShared {
     ikm.extend_from_slice(ml_ss);
     let hk = Hkdf::<Sha256>::new(None, &ikm[..]);
     let mut okm = [0u8; SHARED_LEN];
-    hk.expand(HKDF_INFO, &mut okm).expect("32B OKM 恒合法");
+    hk.expand(HKDF_INFO, &mut okm)
+        .expect("32B OKM is always valid");
     SealedShared(okm)
 }
 
-/// rand 0.9 → rand_core 0.10 私有桥（ml-kem / x25519-dalek 3.0 的 RNG 代际）。
-/// 目标侧要求不可失败（rc010 CryptoRng ⇒ Error=Infallible），故内层熵源故障直接 panic
-/// （同 rand_core `UnwrapErr` 适配器语义）。
+/// Private rand 0.9 → rand_core 0.10 bridge (the RNG generation of ml-kem /
+/// x25519-dalek 3.0). The target side requires infallibility (rc010
+/// CryptoRng ⇒ Error=Infallible), so an inner entropy-source failure panics
+/// directly (same semantics as rand_core's `UnwrapErr` adapter).
 pub(crate) struct RngBridge<'a, R: rand::TryRngCore + ?Sized>(&'a mut R);
 
 pub(crate) fn bridge<R: rand::TryRngCore + ?Sized>(rng: &mut R) -> RngBridge<'_, R> {
@@ -419,7 +474,8 @@ impl<R: rand::TryRngCore + ?Sized> rc010::TryRng for RngBridge<'_, R> {
     }
 }
 
-// rc010 的 TryCryptoRng 是无方法标记 trait，无 blanket impl——需显式声明
+// rc010's TryCryptoRng is a marker trait with no methods and no blanket
+// impl — the explicit declaration is required
 impl<R: rand::TryRngCore + ?Sized> rc010::TryCryptoRng for RngBridge<'_, R> {}
 
 #[cfg(test)]
@@ -428,44 +484,57 @@ mod tests {
     use rand::rngs::OsRng;
 
     fn keypair() -> HybridKeypair {
-        HybridKeypair::generate(&mut OsRng) // OsRng: TryCryptoRng 直接可传
+        HybridKeypair::generate(&mut OsRng) // OsRng: TryCryptoRng, passable directly
     }
 
     #[test]
     fn roundtrip_and_sizes() {
         let sk = keypair();
         let pk = sk.public();
-        assert_eq!(pk.to_bytes().len(), 1216, "混合公钥线上 1216B");
+        assert_eq!(
+            pk.to_bytes().len(),
+            1216,
+            "hybrid public key is 1216B on the wire"
+        );
         let (ss1, ct) = encapsulate(&pk, &mut OsRng);
-        assert_eq!(ct.to_bytes().len(), 1120, "混合密文 1120B");
+        assert_eq!(ct.to_bytes().len(), 1120, "hybrid ciphertext is 1120B");
         let ss2 = decapsulate(&sk, &ct).expect("decapsulate");
-        assert_eq!(ss1.as_bytes(), ss2.as_bytes(), "双方共享密钥一致");
+        assert_eq!(
+            ss1.as_bytes(),
+            ss2.as_bytes(),
+            "both sides derive the same shared secret"
+        );
     }
 
     #[test]
     fn keypair_serialization_roundtrip() {
         let sk = keypair();
         let bytes = sk.to_bytes();
-        assert_eq!(bytes.len(), 96, "私钥 96B = 32 + 64(d‖z)");
+        assert_eq!(bytes.len(), 96, "secret key is 96B = 32 + 64(d‖z)");
         let sk2 = HybridKeypair::from_bytes(&bytes).expect("restore");
         let (ss1, ct) = encapsulate(&sk.public(), &mut OsRng);
         let ss2 = decapsulate(&sk2, &ct).expect("decapsulate");
-        assert_eq!(ss1.as_bytes(), ss2.as_bytes(), "恢复的私钥可解封");
+        assert_eq!(
+            ss1.as_bytes(),
+            ss2.as_bytes(),
+            "restored secret key can decapsulate"
+        );
     }
 
     #[test]
     fn pubkey_from_bytes_rejects_malformed_ek() {
-        // 0xFF 全填充：每个 12-bit t 系数 = 4095 > q-1=3328 ⇒ decodeAndCheck 必拒（确定性）
+        // All-0xFF fill: every 12-bit t coefficient = 4095 > q-1=3328 ⇒
+        // decodeAndCheck must reject (deterministic)
         assert!(
             HybridPubkey::from_bytes(&[0xFFu8; 1216]).is_err(),
-            "越界 t 系数必须被 FIPS 203 ek 校验拒绝"
+            "out-of-range t coefficients must be rejected by FIPS 203 ek validation"
         );
         let sk = keypair();
         let good = HybridPubkey::from_bytes(&sk.public().to_bytes()).expect("valid pk");
         assert_eq!(
             good.to_bytes(),
             sk.public().to_bytes(),
-            "合法公钥往返逐字节一致"
+            "legitimate public key round-trips byte-for-byte"
         );
     }
 
@@ -474,14 +543,21 @@ mod tests {
         let sk = keypair();
         let (ss1, ct) = encapsulate(&sk.public(), &mut OsRng);
         let mut b = ct.to_bytes();
-        b[32 + 100] ^= 0x01; // ML-KEM ct 区翻转
-        let ss2 = decapsulate(&sk, &HybridCt::from_bytes(&b)).expect("隐式拒绝仍返回伪随机钥匙");
-        assert_ne!(ss1.as_bytes(), ss2.as_bytes(), "篡改后共享密钥必不相同");
+        b[32 + 100] ^= 0x01; // flip inside the ML-KEM ct region
+        let ss2 = decapsulate(&sk, &HybridCt::from_bytes(&b))
+            .expect("implicit rejection still returns a pseudo-random key");
+        assert_ne!(
+            ss1.as_bytes(),
+            ss2.as_bytes(),
+            "tampered ciphertext must yield a different shared secret"
+        );
     }
 
     #[test]
     fn ephemeral_freshness() {
-        // 同一公钥两次封装：临时份额不同 ⇒ 共享密钥不同、密文不同（一次性语义的前提）
+        // Two encapsulations against the same public key: differing
+        // ephemeral shares ⇒ different shared secrets and different
+        // ciphertexts (premise of one-time semantics)
         let sk = keypair();
         let (ss1, ct1) = encapsulate(&sk.public(), &mut OsRng);
         let (ss2, ct2) = encapsulate(&sk.public(), &mut OsRng);
@@ -493,44 +569,63 @@ mod tests {
     fn fingerprint_stable_and_display() {
         let sk = keypair();
         let fp1 = fingerprint(&sk.public());
-        assert_eq!(fp1, fingerprint(&sk.public()), "指纹确定性");
+        assert_eq!(
+            fp1,
+            fingerprint(&sk.public()),
+            "fingerprint is deterministic"
+        );
         let pk2 = HybridPubkey::from_bytes(&sk.public().to_bytes()).unwrap();
-        assert_eq!(fp1, fingerprint(&pk2), "公钥序列化往返后指纹不变");
+        assert_eq!(
+            fp1,
+            fingerprint(&pk2),
+            "fingerprint unchanged after public key serialization round-trip"
+        );
         let s = fp1.to_string();
-        assert_eq!(s.split(':').count(), 8, "8 组展示");
+        assert_eq!(s.split(':').count(), 8, "8-group display");
         assert!(s
             .split(':')
             .all(|g| g.len() == 8 && g.bytes().all(|b| b.is_ascii_hexdigit())));
         let sk3 = keypair();
-        assert_ne!(fp1, fingerprint(&sk3.public()), "不同密钥指纹不同");
+        assert_ne!(
+            fp1,
+            fingerprint(&sk3.public()),
+            "different keys have different fingerprints"
+        );
     }
 
     #[test]
     fn cross_keypair_shared_mismatch() {
         let (sk_a, sk_b) = (keypair(), keypair());
         let (ss, ct) = encapsulate(&sk_a.public(), &mut OsRng);
-        let ss_b = decapsulate(&sk_b, &ct).expect("隐式拒绝伪随机钥匙");
-        assert_ne!(ss.as_bytes(), ss_b.as_bytes(), "第三方无法得到同一共享密钥");
+        let ss_b = decapsulate(&sk_b, &ct).expect("implicit-rejection pseudo-random key");
+        assert_ne!(
+            ss.as_bytes(),
+            ss_b.as_bytes(),
+            "a third party cannot obtain the same shared secret"
+        );
     }
 
-    /// 清零纪律（§1.3.3c）：SealedShared 显式 zeroize 后 32B 全零（Drop 路径同一实现）。
+    /// Zeroization discipline (§1.3.3c): after explicit zeroize, all 32B of
+    /// SealedShared are zero (the Drop path uses the same implementation).
     #[test]
     fn sealed_shared_zeroize_clears_material() {
         let sk = keypair();
         let (mut ss, _ct) = encapsulate(&sk.public(), &mut OsRng);
         assert!(
             ss.as_bytes().iter().any(|&b| b != 0),
-            "前置：封装产物非全零（否则断言空转）"
+            "precondition: encapsulation output is not all-zero (otherwise the assertion is vacuous)"
         );
         zeroize::Zeroize::zeroize(&mut ss);
         assert!(
             ss.as_bytes().iter().all(|&b| b == 0),
-            "zeroize 必须覆盖全部 32B 共享密钥材料"
+            "zeroize must cover all 32B of shared secret material"
         );
     }
 
-    /// seed_material 往返（split 模式专用，flock-sync 迁移载体）：等效密钥对——
-    /// 公钥逐字节一致、合法密文解封一致；重建确定性；不同种子不同公钥。
+    /// seed_material round-trip (split mode only, the flock-sync migration
+    /// carrier): equivalent keypair — public key byte-for-byte identical,
+    /// legitimate ciphertext decapsulation identical; rebuild is
+    /// deterministic; different seeds give different public keys.
     #[test]
     fn seed_material_roundtrip_equivalent_and_deterministic() {
         let sk = keypair();
@@ -539,18 +634,25 @@ mod tests {
         assert_eq!(
             sk2.public().to_bytes(),
             sk.public().to_bytes(),
-            "等效：公钥逐字节一致"
+            "equivalent: public key byte-for-byte identical"
         );
         let (ss1, ct) = encapsulate(&sk.public(), &mut OsRng);
-        let ss2 = decapsulate(&sk2, &ct).expect("等效钥可解封");
-        assert_eq!(ss1.as_bytes(), ss2.as_bytes(), "等效：合法密文解封一致");
+        let ss2 = decapsulate(&sk2, &ct).expect("equivalent key can decapsulate");
+        assert_eq!(
+            ss1.as_bytes(),
+            ss2.as_bytes(),
+            "equivalent: legitimate ciphertext decapsulation identical"
+        );
 
-        // 确定性：同种子重建两次公钥一致。
+        // Determinism: rebuilding twice from the same seed gives the same
+        // public key.
         let sk3 = HybridKeypair::from_seed_material(&seed);
         assert_eq!(sk3.public().to_bytes(), sk2.public().to_bytes());
 
-        // 不同种子 ⇒ 不同公钥（翻转中段字节位：X25519 标量钳位会抹掉首字节低 3 位，
-        // 翻 bit0 会被钳位吞掉——选取必然存活的字节位）。
+        // Different seed ⇒ different public key (flip a mid-range byte bit:
+        // X25519 scalar clamping erases the low 3 bits of the first byte, a
+        // bit0 flip would be swallowed by clamping — choose a byte position
+        // that always survives).
         let mut other = seed;
         other[10] ^= 0x01;
         assert_ne!(
@@ -560,8 +662,9 @@ mod tests {
             sk2.public().to_bytes()
         );
 
-        // 96B to_bytes/from_bytes 仍是全量无损序列化（与 64B 种子载体并存）。
-        let full = HybridKeypair::from_bytes(&sk.to_bytes()).expect("全量序列化");
+        // 96B to_bytes/from_bytes remains the full lossless serialization
+        // (coexisting with the 64B seed carrier).
+        let full = HybridKeypair::from_bytes(&sk.to_bytes()).expect("full serialization");
         assert_eq!(full.public().to_bytes(), sk.public().to_bytes());
     }
 }

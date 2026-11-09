@@ -1,14 +1,24 @@
-//! session/mux 集成测试（docs/design.md §7-M1 完成标准）。
+//! session/mux integration tests (docs/design.md §7-M1 completion
+//! criteria).
 //!
-//! 覆盖向量：
-//! - 握手双形态全向量：已钉扎 1-RTT（duplex + TcpStream 对拨）；TOFU 首连 2-RTT
-//!   （I0→R0→I1/R1）状态机含负向（伪造入群凭证/伪造 R0 签名/错序消息）；
-//! - UKS/绑定失败向量：篡改协议上下文（cluster_id）或换服务器身份 ⇒ 验签必失败（§1.3.3c）；
-//! - DeviceDirectory 三态：NotFound/Revoked/Active（前两者拒且同一不透明错误）；
-//! - AEAD 协商：交集取档 + 无交集拒；
-//! - 抗重放（proxy 字节级重放已封记录）与伪造断链（100 次断链）；
-//! - 时钟注入：120s 触发 rekey（双侧 epoch 推进 + rekey 后数据通）、180s 硬拒绝；
-//! - mux：流回显、显式 finish()/FIN、禁隐式 shutdown、PacketChannel 帧边界、并发流。
+//! Coverage vectors:
+//! - Full dual-form handshake vectors: pinned 1-RTT (duplex + TcpStream
+//!   dial pairs); TOFU first-connect 2-RTT (I0→R0→I1/R1) state machine
+//!   including negatives (forged join credentials/forged R0
+//!   signature/out-of-order messages);
+//! - UKS/binding failure vectors: tampering with the protocol context
+//!   (cluster_id) or swapping the server identity ⇒ verification
+//!   necessarily fails (§1.3.3c);
+//! - DeviceDirectory three states: NotFound/Revoked/Active (the first
+//!   two reject with the same opaque error);
+//! - AEAD negotiation: intersection tier selection + no-intersection
+//!   rejection;
+//! - Anti-replay (proxy byte-level replay of an already-sealed record)
+//!   and forgery teardown (teardown at 100 attempts);
+//! - Clock injection: 120s triggers rekey (both sides' epochs advance +
+//!   data flows after the rekey), 180s hard reject;
+//! - mux: stream echo, explicit finish()/FIN, implicit shutdown disabled,
+//!   PacketChannel frame boundaries, concurrent streams.
 
 use std::time::Duration;
 
@@ -26,7 +36,7 @@ use ed25519_dalek::SigningKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 // ============================================================================
-// 装配
+// Assembly
 // ============================================================================
 
 struct Fix {
@@ -70,7 +80,7 @@ fn duplex_pair() -> (DuplexStream, DuplexStream) {
     tokio::io::duplex(256 * 1024)
 }
 
-/// 标准 1-RTT 会话对（duplex 对拨 + InMemory 目录）。
+/// A standard 1-RTT session pair (duplex dial + InMemory directory).
 async fn session_pair() -> (Tunnel, Tunnel) {
     session_pair_cfg(TunnelConfig::default(), TunnelConfig::default()).await
 }
@@ -130,12 +140,15 @@ async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("wait_until 超时: {what}");
+    panic!("wait_until timed out: {what}");
 }
 
-/// 通用「首帧后驻留」代理：c→s 透明；s→c 只回放第一帧后停读（连接保持打开）。
+/// A generic "park after the first frame" proxy: c→s transparent; s→c
+/// replays only the first frame and then stops reading (the connection
+/// stays open).
 async fn park_after_first_frame(client_side: DuplexStream, server_side: DuplexStream) {
-    // 方向：c_rd（读客户端）→ s_wr（写服务端）；s_rd（读服务端）→ c_wr（写客户端）
+    // Directions: c_rd (read client) → s_wr (write server); s_rd (read
+    // server) → c_wr (write client)
     let (mut c_rd, mut c_wr) = tokio::io::split(client_side);
     let (mut s_rd, mut s_wr) = tokio::io::split(server_side);
     tokio::spawn(async move {
@@ -150,32 +163,36 @@ async fn park_after_first_frame(client_side: DuplexStream, server_side: DuplexSt
         let _ = c_wr.write_all(&hdr).await;
         let _ = c_wr.write_all(&body).await;
         let _ = c_wr.flush().await;
-        let _: () = std::future::pending().await; // 驻留：s→c 不再转发、不再读
+        let _: () = std::future::pending().await; // parked: s→c neither
+                                                  // forwards nor reads
+                                                  // anymore
     });
 }
 
 // ============================================================================
-// 已钉扎 1-RTT 握手 + mux 数据面
+// Pinned 1-RTT handshake + mux data plane
 // ============================================================================
 
 #[tokio::test]
 async fn pinned_1rtt_handshake_and_stream_echo() {
     let (client, server) = session_pair().await;
 
-    // 1-RTT 佐证：握手本身不消耗记录层计数（yamux 启动引导帧 = 首批记录；
-    // 客户端首条线上消息必为 I1 由 pinned_i1_tamper_rejected_by_aad 的 proxy 断言覆盖）
+    // 1-RTT corroboration: the handshake itself consumes no record-layer
+    // counters (the yamux bootstrap frames = the first records; that the
+    // client's first wire message must be I1 is covered by the proxy
+    // assertion in pinned_i1_tamper_rejected_by_aad)
     let st = client.stats();
     assert_eq!(st.epoch, 0);
     assert!(st.closed.is_none());
     assert!(
         st.sent_records <= 2,
-        "yamux 引导帧之外无多余记录: {}",
+        "no extra records beyond the yamux bootstrap frames: {}",
         st.sent_records
     );
     assert!(client.stats().closed.is_none());
     assert!(
         client.peer_server_id().is_some(),
-        "客户端可索引对端服务器（漫游模型）"
+        "the client can index the peer server (roaming model)"
     );
     assert!(server.peer_device_id().is_some());
 
@@ -195,13 +212,14 @@ async fn pinned_1rtt_handshake_and_stream_echo() {
     assert!(client.stats().sent_records >= 1);
     assert!(server.stats().received_records >= 1);
 
-    // 显式 finish() ⇒ 对端观察到 FIN/EOF（禁半关闭：yamux FIN 是唯一单向结束路径）
+    // Explicit finish() ⇒ the peer observes FIN/EOF (half-close
+    // forbidden: the yamux FIN is the only unidirectional finish path)
     cs.finish().await.expect("client finish");
     let mut eof = [0u8; 4];
     let n = tokio::time::timeout(Duration::from_secs(5), ss.read_some(&mut eof))
         .await
         .expect("eof timeout");
-    assert_eq!(n.expect("read_some"), 0, "对端观察到 FIN/EOF");
+    assert_eq!(n.expect("read_some"), 0, "the peer observes FIN/EOF");
 
     client.shutdown().await;
     server.shutdown().await;
@@ -238,9 +256,10 @@ async fn pinned_handshake_over_tcp_pair() {
     });
     let (client, server) = (cli.await.expect("cli"), srv.await.expect("srv"));
 
-    // TcpStream 对拨：PacketChannel 帧边界（§3.6 [u16 len][ip packet]）
+    // TcpStream dial pair: PacketChannel frame boundaries (§3.6 [u16
+    // len][ip packet])
     let mut cpc = client.open_packet_channel().await.expect("packet channel");
-    cpc.send(&[0u8; 1]).await.expect("SYN 首包"); // yamux SYN 惰性：首帧携带
+    cpc.send(&[0u8; 1]).await.expect("SYN first packet"); // yamux lazy SYN: carried by the first frame
     let accepted = tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
         .await
         .expect("accept timeout")
@@ -254,7 +273,7 @@ async fn pinned_handshake_over_tcp_pair() {
         }
         first = false;
         let got = spc.recv().await.expect("recv");
-        assert_eq!(got.len(), size, "帧边界保持");
+        assert_eq!(got.len(), size, "frame boundaries preserved");
         assert_eq!(got, pkt);
     }
     client.shutdown().await;
@@ -266,24 +285,26 @@ async fn packet_channel_recv_stream_and_finish() {
     use futures::StreamExt;
     let (client, server) = session_pair().await;
     let mut cpc = client.open_packet_channel().await.expect("client pc");
-    cpc.send(&[1, 2, 3]).await.expect("c send（携 SYN）");
+    cpc.send(&[1, 2, 3])
+        .await
+        .expect("c send (carries the SYN)");
     let accepted = tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
         .await
         .expect("accept")
         .expect("stream");
     let mut spc = flock_protocol::mux::PacketChannel::from_stream(accepted);
 
-    // 双向包
+    // Bidirectional packets
 
     assert_eq!(spc.recv().await.expect("s recv"), vec![1, 2, 3]);
     spc.send(&[4, 5]).await.expect("s send");
     assert_eq!(cpc.recv().await.expect("c recv"), vec![4, 5]);
 
-    // recv_stream 迭代：对端 finish 后以 None 收尾
+    // recv_stream iteration: after the peer's finish, it ends with None
     spc.finish().await.expect("s finish");
     let mut rx = cpc.recv_stream();
     let first = rx.next().await;
-    assert!(first.is_none(), "对端 FIN ⇒ 流结束（无残包）");
+    assert!(first.is_none(), "peer FIN ⇒ stream end (no partial packet)");
     client.shutdown().await;
     server.shutdown().await;
 }
@@ -295,7 +316,8 @@ async fn multiple_streams_and_prio_passthrough() {
     let mut s2 = client.open_stream(Prio::Normal).await.expect("s2");
     assert_eq!(s1.prio(), Prio::Control);
 
-    // yamux SYN 惰性（首帧携带）：先写再 accept
+    // yamux lazy SYN (carried by the first frame): write first, then
+    // accept
     s1.write_all(b"one").await.expect("w1");
     s2.write_all(b"two").await.expect("w2");
     let mut a1 = tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
@@ -320,21 +342,23 @@ async fn multiple_streams_and_prio_passthrough() {
 async fn implicit_shutdown_disabled_on_stream() {
     let (client, _server) = session_pair().await;
     let mut s = client.open_stream(Prio::Normal).await.expect("stream");
-    // futures AsyncWriteExt::close 映射 poll_close ⇒ 必须拒绝（禁半关闭：单向结束只有 finish()）
+    // futures AsyncWriteExt::close maps to poll_close ⇒ must be rejected
+    // (half-close forbidden: finish() is the only unidirectional finish)
     let r = futures::AsyncWriteExt::close(&mut s).await;
-    assert!(r.is_err(), "隐式 shutdown 必须被拒");
+    assert!(r.is_err(), "implicit shutdown must be rejected");
     drop(s);
     client.shutdown().await;
 }
 
 // ============================================================================
-// UKS / 绑定失败向量（§1.3.3c 签名覆盖契约）
+// UKS / binding failure vectors (§1.3.3c signature coverage contract)
 // ============================================================================
 
 #[tokio::test]
 async fn uks_wrong_server_identity_rejected() {
-    // 客户端钉扎 server A，I1 却被交给 server B（MITM 改道）：
-    // 设备签名覆盖「期望身份 = A」⇒ B 处必须失败。
+    // The client pins server A, but the I1 is handed to server B (MITM
+    // redirection): the device signature covers "expected identity = A"
+    // ⇒ it must fail at B.
     let root = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
     let cluster = ClusterId(rand::random());
     let server_a = ServerIdentity::enroll(&root, cluster, ServerId(rand::random()), "a.example:1");
@@ -359,23 +383,24 @@ async fn uks_wrong_server_identity_rejected() {
         )
         .await
     });
-    let srv_err = srv.await.expect("task").expect_err("respond 必拒");
+    let srv_err = srv.await.expect("task").expect_err("respond must reject");
     let _ = cli.await.expect("cli task").expect("timeout");
 
     match &srv_err {
         SessionError::Handshake(stage) => {
             assert!(
                 stage.contains("expected-server-identity") || stage.contains("device signature"),
-                "UKS 向量失败于身份/签名检查，got {stage}"
+                "the UKS vector fails at the identity/signature check, got {stage}"
             );
         }
-        other => panic!("期望 Handshake 错误，got {other:?}"),
+        other => panic!("expected a Handshake error, got {other:?}"),
     }
 }
 
 #[tokio::test]
 async fn uks_tampered_cluster_context_rejected() {
-    // 篡改协议上下文：pin 的 cluster_id 与服务器不一致 ⇒ 设备签名覆盖失配。
+    // Tampered protocol context: the pin's cluster_id mismatches the
+    // server ⇒ device-signature coverage mismatch.
     let fix = fixture();
     let device = DeviceStaticKeys::generate();
     let mut dir = InMemoryDirectory::new();
@@ -387,7 +412,7 @@ async fn uks_tampered_cluster_context_rejected() {
     let srv = tokio::spawn(async move { respond(b, &server, dir, TunnelConfig::default()).await });
 
     let mut pin = pin;
-    pin.cluster_id = ClusterId(rand::random()); // ← 篡改上下文
+    pin.cluster_id = ClusterId(rand::random()); // ← tampered context
     let cli = tokio::spawn(async move {
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -395,17 +420,18 @@ async fn uks_tampered_cluster_context_rejected() {
         )
         .await
     });
-    let srv_err = srv.await.expect("task").expect_err("必拒");
+    let srv_err = srv.await.expect("task").expect_err("must reject");
     let _ = cli.await.expect("cli task").expect("timeout");
     assert!(
         matches!(&srv_err, SessionError::Handshake(s) if s.contains("device signature")),
-        "cluster_id 篡改 ⇒ 设备签名验签失败，got {srv_err:?}"
+        "cluster_id tampering ⇒ device signature verification fails, got {srv_err:?}"
     );
 }
 
 #[tokio::test]
 async fn pinned_i1_tamper_rejected_by_aad() {
-    // I1 已发字段（ml_kem_ct）被字节级篡改 ⇒ AAD 失配 ⇒ 解密失败。
+    // An I1 sent field (ml_kem_ct) tampered at the byte level ⇒ AAD
+    // mismatch ⇒ decryption failure.
     let fix = fixture();
     let device = DeviceStaticKeys::generate();
     let mut dir = InMemoryDirectory::new();
@@ -431,15 +457,20 @@ async fn pinned_i1_tamper_rejected_by_aad() {
         )
         .await
     });
-    // 代理：读 I1（断言形态），翻转 ml_ct 首字节转发
+    // Proxy: read the I1 (assert its shape), flip the first ml_ct byte,
+    // forward
     let (t, mut body) = read_frame(&mut p_client).await.expect("first frame");
-    assert_eq!(t, RT_I1, "已钉扎形态首帧必为 I1（1-RTT 佐证）");
+    assert_eq!(
+        t, RT_I1,
+        "the pinned form's first frame must be I1 (1-RTT corroboration)"
+    );
     assert!(body.len() > 70);
-    body[69] ^= 0xFF; // ml_kem_ct 区首字节（AAD 覆盖字段）
+    body[69] ^= 0xFF; // first byte of the ml_kem_ct region (an AAD-covered field)
     write_frame(&mut p_server, RT_I1, &body)
         .await
         .expect("forward tampered");
-    // 双向后续吞掉（各读各的，丢弃即可）
+    // Swallow the subsequent traffic in both directions (each side reads
+    // its own and discards)
     {
         let (mut cr, _) = tokio::io::split(p_client);
         tokio::spawn(async move {
@@ -464,19 +495,20 @@ async fn pinned_i1_tamper_rejected_by_aad() {
     }
     let srv_out = srv.await.expect("task");
     let srv_err = match srv_out {
-        Ok(_) => panic!("篡改后 respond 必须拒绝"),
+        Ok(_) => panic!("respond must reject after tampering"),
         Err(e) => e,
     };
-    // 客户端侧必失败（EOF/超时皆可——proxy 不转发 EOF，不精确断言其形态）
+    // The client side must fail too (EOF/timeout both fine — the proxy
+    // does not forward EOF, so its exact shape is not asserted)
     let _ = tokio::time::timeout(Duration::from_secs(3), cli).await;
     assert!(
         matches!(&srv_err, SessionError::Handshake(s) if s.contains("i1 payload")),
-        "I1 字段篡改 ⇒ AAD 失配解密失败，got {srv_err:?}"
+        "I1 field tampering ⇒ AAD mismatch decryption failure, got {srv_err:?}"
     );
 }
 
 // ============================================================================
-// DeviceDirectory 三态 + AEAD 协商
+// DeviceDirectory three states + AEAD negotiation
 // ============================================================================
 
 #[tokio::test]
@@ -503,14 +535,15 @@ async fn directory_three_states() {
         )
         .await
     });
-    let not_found = srv.await.expect("task").expect_err("NotFound 必拒");
+    let not_found = srv.await.expect("task").expect_err("NotFound must reject");
     let _ = cli.await.expect("cli").expect("timeout");
     assert!(
         matches!(not_found, SessionError::DeviceRejected),
         "NotFound ⇒ {not_found:?}"
     );
 
-    // Revoked（与 NotFound 同一错误变体——时序对齐/防枚举）
+    // Revoked (same error variant as NotFound — timing-aligned /
+    // anti-enumeration)
     let fix = fixture();
     let device = DeviceStaticKeys::generate();
     let mut dir = InMemoryDirectory::new();
@@ -527,7 +560,7 @@ async fn directory_three_states() {
         )
         .await
     });
-    let revoked = srv.await.expect("task").expect_err("Revoked 必拒");
+    let revoked = srv.await.expect("task").expect_err("Revoked must reject");
     let _ = cli.await.expect("cli").expect("timeout");
     assert!(
         matches!(revoked, SessionError::DeviceRejected),
@@ -536,16 +569,17 @@ async fn directory_three_states() {
     assert_eq!(
         std::mem::discriminant(&not_found),
         std::mem::discriminant(&revoked),
-        "三态拒绝对齐：NotFound 与 Revoked 不可区分"
+        "three-state rejection aligned: NotFound and Revoked are indistinguishable"
     );
 
-    // 公钥失配：注册记录的 X25519 公钥 ≠ 呈现材料 ⇒ 同一不透明拒绝
+    // Public-key mismatch: the registered record's X25519 public key ≠
+    // the presented material ⇒ the same opaque rejection
     let fix = fixture();
     let device = DeviceStaticKeys::generate();
     let mut dir = InMemoryDirectory::new();
     register(&mut dir, &device);
     dir.register(DeviceRecord {
-        device_x25519: DeviceStaticKeys::generate().x25519_public(), // ← 失配
+        device_x25519: DeviceStaticKeys::generate().x25519_public(), // ← mismatch
         device_ed25519: device.ed25519_public(),
     });
     let (a, b) = duplex_pair();
@@ -559,20 +593,21 @@ async fn directory_three_states() {
         )
         .await
     });
-    let mismatch = srv.await.expect("task").expect_err("失配必拒");
+    let mismatch = srv.await.expect("task").expect_err("mismatch must reject");
     let _ = cli.await.expect("cli").expect("timeout");
     assert!(
         matches!(mismatch, SessionError::DeviceRejected),
-        "公钥失配 ⇒ {mismatch:?}"
+        "public-key mismatch ⇒ {mismatch:?}"
     );
 
-    // Active：正常路径
+    // Active: the normal path
     let (_c, _s) = session_pair().await;
 }
 
 #[tokio::test]
 async fn aead_negotiation_intersection_and_failure() {
-    // 客户端只持 XChaCha ⇒ 协商取交集为 XChaCha（双方 stats 一致）
+    // The client holds only XChaCha ⇒ the negotiated intersection is
+    // XChaCha (both sides' stats agree)
     let c_cfg = TunnelConfig {
         aead: AeadPreference::only(AeadChoice::XChaCha20Poly1305),
         ..TunnelConfig::default()
@@ -592,7 +627,7 @@ async fn aead_negotiation_intersection_and_failure() {
     client.shutdown().await;
     server.shutdown().await;
 
-    // 无交集 ⇒ AeadMismatch（服务端 respond 拒）
+    // No intersection ⇒ AeadMismatch (server respond rejects)
     let fix = fixture();
     let device = DeviceStaticKeys::generate();
     let mut dir = InMemoryDirectory::new();
@@ -612,16 +647,19 @@ async fn aead_negotiation_intersection_and_failure() {
     let cli = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(10), initiate(a, &device, &pin, c_cfg)).await
     });
-    let err = srv.await.expect("task").expect_err("无交集必拒");
+    let err = srv
+        .await
+        .expect("task")
+        .expect_err("no intersection must reject");
     let _ = cli.await.expect("cli").expect("timeout");
     assert!(
         matches!(err, SessionError::AeadMismatch),
-        "无交集 ⇒ {err:?}"
+        "no intersection ⇒ {err:?}"
     );
 }
 
 // ============================================================================
-// TOFU 首连 2-RTT 状态机
+// TOFU first-connect 2-RTT state machine
 // ============================================================================
 
 #[tokio::test]
@@ -643,7 +681,8 @@ async fn tofu_happy_path_i0_r0_i1_r1() {
     .await
     .expect("timeout")
     .expect("bootstrap");
-    // 根指纹展示（用户确认 UI 的数据源）与集群/条目材料
+    // Root fingerprint display (the data source of the user-confirmation
+    // UI) and the cluster/entry material
     assert_eq!(
         boot.root_fingerprint(),
         fingerprint_ed25519(&fix.root.verifying_key())
@@ -670,7 +709,8 @@ async fn tofu_happy_path_i0_r0_i1_r1() {
 
 #[tokio::test]
 async fn tofu_rejects_forged_enrollment_chain() {
-    // 伪造入群凭证：entry_sig 被篡改 ⇒ 根验签失败
+    // Forged join credential: entry_sig tampered ⇒ root verification
+    // fails
     let fix = fixture();
     let device = DeviceStaticKeys::generate();
     let mut bad = fix.server;
@@ -688,13 +728,14 @@ async fn tofu_rejects_forged_enrollment_chain() {
     )
     .await
     .expect("timeout")
-    .expect_err("伪造凭证必拒");
+    .expect_err("forged credential must reject");
     assert!(
         matches!(&err, SessionError::Handshake(s) if s.contains("enrollment signature")),
-        "伪造入群凭证 ⇒ {err:?}"
+        "forged join credential ⇒ {err:?}"
     );
 
-    // 伪造 R0 身份签名：R0 用另一身份钥签 ⇒ entry.identity_pub 验签失败
+    // Forged R0 identity signature: R0 signed with another identity key
+    // ⇒ entry.identity_pub verification fails
     let fix = fixture();
     let device = DeviceStaticKeys::generate();
     let mut bad2 = fix.server;
@@ -709,21 +750,22 @@ async fn tofu_rejects_forged_enrollment_chain() {
     )
     .await
     .expect("timeout")
-    .expect_err("伪造 R0 签名必拒");
+    .expect_err("forged R0 signature must reject");
     assert!(
         matches!(&err, SessionError::Handshake(s) if s.contains("server identity signature")),
-        "伪造 R0 身份签名 ⇒ {err:?}"
+        "forged R0 identity signature ⇒ {err:?}"
     );
 }
 
 #[tokio::test]
 async fn tofu_state_machine_rejects_out_of_order() {
-    // 客户端处于 TOFU（发 I0 等 R0），却收到 R1 ⇒ 状态机拒
+    // The client is in TOFU (sent I0, waiting for R0) but receives R1 ⇒
+    // the state machine rejects
     let device = DeviceStaticKeys::generate();
     let (a, mut fake) = duplex_pair();
     tokio::spawn(async move {
         let (t, _i0) = read_frame(&mut fake).await.expect("read I0");
-        assert_eq!(t, RT_I0, "TOFU 首帧必为 I0");
+        assert_eq!(t, RT_I0, "the TOFU first frame must be I0");
         write_frame(&mut fake, RT_R1, &[0u8; 8])
             .await
             .expect("write R1");
@@ -741,13 +783,14 @@ async fn tofu_state_machine_rejects_out_of_order() {
     )
     .await
     .expect("timeout")
-    .expect_err("TOFU 首步非 R0 必拒");
+    .expect_err("a non-R0 first step in TOFU must reject");
     assert!(
         matches!(err, SessionError::UnexpectedMessage(t) if t == RT_R1),
-        "TOFU 状态机错序拒 ⇒ {err:?}"
+        "TOFU state machine rejects out-of-order ⇒ {err:?}"
     );
 
-    // 服务端状态机：首帧非 I0/I1（如 DATA）⇒ 拒
+    // Server state machine: a first frame that is not I0/I1 (e.g. DATA)
+    // ⇒ rejected
     let fix = fixture();
     let (mut c, b) = duplex_pair();
     let srv = tokio::spawn(async move {
@@ -763,23 +806,29 @@ async fn tofu_state_machine_rejects_out_of_order() {
     write_frame(&mut c, RT_DATA, &[0u8; 32])
         .await
         .expect("write DATA");
-    let err = srv.await.expect("task").expect_err("非握手首帧必拒");
+    let err = srv
+        .await
+        .expect("task")
+        .expect_err("a non-handshake first frame must reject");
     assert!(
         matches!(err, SessionError::UnexpectedMessage(t) if t == RT_DATA),
-        "respond 状态机拒 ⇒ {err:?}"
+        "respond state machine rejects ⇒ {err:?}"
     );
 }
 
 // ============================================================================
-// 时钟注入：rekey（120s）/ 硬拒绝（180s）/ 死链（3×keepalive）
+// Clock injection: rekey (120s) / hard reject (180s) / dead link
+// (3×keepalive)
 // ============================================================================
 
 #[tokio::test]
 async fn clock_injection_rekey_both_sides() {
     use std::sync::Arc;
     let clock = Arc::new(ManualClock::new());
-    // keepalive 放大隔离死链判定：注入时钟一次前拨 119s，若 keepalive=10s 则
-    // 3×keepalive 静默判定先于 rekey 触发（死链语义由 keepalive_deadlink_detection 覆盖）。
+    // Enlarge keepalive to isolate the dead-link verdict: the injected
+    // clock jumps 119s at once; with keepalive=10s the 3×keepalive
+    // silence verdict would fire before the rekey trigger (dead-link
+    // semantics are covered by keepalive_deadlink_detection).
     let c_cfg = TunnelConfig {
         clock: clock.clone(),
         keepalive: Duration::from_secs(3600),
@@ -796,17 +845,18 @@ async fn clock_injection_rekey_both_sides() {
 
     clock.advance(Duration::from_secs(119));
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(client.stats().epoch, 0, "119s 不触发 rekey");
+    assert_eq!(client.stats().epoch, 0, "119s does not trigger a rekey");
 
     clock.advance(Duration::from_secs(2));
-    wait_until("双侧 epoch → 1", || {
+    wait_until("both epochs → 1", || {
         client.stats().epoch == 1 && server.stats().epoch == 1
     })
     .await;
     assert_eq!(client.stats().rekeys, 1);
     assert_eq!(server.stats().rekeys, 1);
 
-    // rekey 后数据照常（计数器随新密钥重置）
+    // Data flows as usual after the rekey (counters reset with the new
+    // keys)
     let mut cs = client
         .open_stream(Prio::Normal)
         .await
@@ -827,12 +877,13 @@ async fn clock_injection_rekey_both_sides() {
 #[tokio::test]
 async fn clock_injection_hard_reject_180s() {
     use std::sync::Arc;
-    // client ⇄ park-proxy ⇄ server：REKEY_RESP 永远到不了客户端但连接不关 ⇒ 181s 注入
-    // 时钟触发硬拒绝。
+    // client ⇄ park-proxy ⇄ server: the REKEY_RESP never reaches the
+    // client but the connection stays open ⇒ the injected 181s clock
+    // triggers the hard reject.
     let clock = Arc::new(ManualClock::new());
     let c_cfg = TunnelConfig {
         clock: clock.clone(),
-        keepalive: Duration::from_secs(3600), // 隔离 DeadLink 判定
+        keepalive: Duration::from_secs(3600), // isolate the DeadLink verdict
         ..TunnelConfig::default()
     };
 
@@ -863,15 +914,23 @@ async fn clock_injection_hard_reject_180s() {
     });
     let client = cli.await.expect("cli task");
 
-    clock.advance(Duration::from_secs(121)); // REKEY_INIT 发出（RESP 被吞）
+    clock.advance(Duration::from_secs(121)); // REKEY_INIT sent (RESP swallowed)
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(client.stats().epoch, 0, "RESP 被吞 ⇒ 纪元不进");
+    assert_eq!(
+        client.stats().epoch,
+        0,
+        "RESP swallowed ⇒ epoch does not advance"
+    );
     assert!(client.stats().closed.is_none());
 
-    clock.advance(Duration::from_secs(60)); // 181s：硬拒绝
-    wait_until("180s 硬拒绝", || client.stats().closed.is_some()).await;
+    clock.advance(Duration::from_secs(60)); // 181s: hard reject
+    wait_until("180s hard reject", || client.stats().closed.is_some()).await;
     let st = client.stats();
-    assert_eq!(st.closed, Some(CloseReason::RejectAfter), "硬拒绝原因");
+    assert_eq!(
+        st.closed,
+        Some(CloseReason::RejectAfter),
+        "hard-reject reason"
+    );
     assert_eq!(st.epoch, 0);
     drop(client);
     let _ = srv.await;
@@ -880,7 +939,8 @@ async fn clock_injection_hard_reject_180s() {
 #[tokio::test]
 async fn keepalive_deadlink_detection() {
     use std::sync::Arc;
-    // keepalive 1s（注入时钟）+ s→c 停读 ⇒ 3×keepalive 无入站判死链。
+    // keepalive 1s (injected clock) + s→c stops reading ⇒ 3×keepalive
+    // with no inbound verdicts a dead link.
     let clock = Arc::new(ManualClock::new());
     let c_cfg = TunnelConfig {
         clock: clock.clone(),
@@ -915,28 +975,29 @@ async fn keepalive_deadlink_detection() {
     });
     let client = cli.await.expect("cli");
 
-    clock.advance(Duration::from_millis(3400)); // > 3×1s 无入站
-    wait_until("死链检测", || client.stats().closed.is_some()).await;
+    clock.advance(Duration::from_millis(3400)); // > 3×1s with no inbound
+    wait_until("dead-link detection", || client.stats().closed.is_some()).await;
     assert_eq!(client.stats().closed, Some(CloseReason::DeadLink));
     drop(client);
     let _ = srv.await;
 }
 
 // ============================================================================
-// 伪造断链与抗重放（注入已封记录）
+// Forgery teardown and anti-replay (sealed records injected)
 // ============================================================================
 
-/// c→s 侧：转发 I1 后注入 `garbage_n` 条合法帧长但密文随机的记录，其余透明。
+/// c→s side: forward the I1, then inject `garbage_n` records with legal
+/// frame lengths but random ciphertexts; the rest is transparent.
 async fn forge_proxy(client_side: DuplexStream, server_side: DuplexStream, garbage_n: u32) {
     let (mut c_rd, mut c_wr) = tokio::io::split(client_side);
     let (mut s_rd, mut s_wr) = tokio::io::split(server_side);
-    // s→c 透明（读服务端 → 写客户端）
+    // s→c transparent (read server → write client)
     {
         tokio::spawn(async move {
             let _ = tokio::io::copy(&mut s_rd, &mut c_wr).await;
         });
     }
-    // c→s：I1 转发 + 伪造注入 + 余量透传
+    // c→s: I1 forward + forgery injection + transparent remainder
     tokio::spawn(async move {
         let mut hdr = [0u8; 5];
         if c_rd.read_exact(&mut hdr).await.is_err() {
@@ -950,7 +1011,8 @@ async fn forge_proxy(client_side: DuplexStream, server_side: DuplexStream, garba
         let _ = s_wr.write_all(&hdr).await;
         let _ = s_wr.write_all(&body).await;
         for i in 0..garbage_n {
-            // 合法帧长（len=17 = type + 16B 密文）、认证必失败的记录
+            // Legal frame length (len=17 = type + 16B ciphertext),
+            // records that necessarily fail authentication
             let mut frame = Vec::with_capacity(21);
             frame.extend_from_slice(&17u32.to_le_bytes());
             frame.push(RT_DATA);
@@ -999,11 +1061,14 @@ async fn forge_session(garbage_n: u32) -> (Tunnel, Tunnel) {
 #[tokio::test]
 async fn forge_limit_breaks_link_at_100() {
     let (client, server) = forge_session(100).await;
-    wait_until("100 次伪造断链", || server.stats().closed.is_some()).await;
+    wait_until("100 forgeries tear down the link", || {
+        server.stats().closed.is_some()
+    })
+    .await;
     let st = server.stats();
     assert_eq!(st.closed, Some(CloseReason::ForgeLimit));
-    assert_eq!(st.forge_attempts, 100, "恰好第 100 次断链");
-    // 断链波及客户端（其后续写失败/EOF）
+    assert_eq!(st.forge_attempts, 100, "teardown at exactly the 100th");
+    // The teardown reaches the client (its subsequent writes fail/EOF)
     drop(client);
     server.shutdown().await;
 }
@@ -1011,8 +1076,11 @@ async fn forge_limit_breaks_link_at_100() {
 #[tokio::test]
 async fn forged_records_below_limit_keep_link() {
     let (client, server) = forge_session(99).await;
-    wait_until("伪造计数到位", || server.stats().forge_attempts >= 99).await;
-    assert_eq!(server.stats().closed, None, "99 次不断链");
+    wait_until("forgery count in place", || {
+        server.stats().forge_attempts >= 99
+    })
+    .await;
+    assert_eq!(server.stats().closed, None, "99 attempts do not tear down");
     let mut cs = client.open_stream(Prio::Normal).await.expect("open");
     cs.write_all(b"alive").await.expect("w");
     let mut ss = tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
@@ -1026,17 +1094,19 @@ async fn forged_records_below_limit_keep_link() {
     server.shutdown().await;
 }
 
-/// c→s 侧：I1 之后的**第一条已封记录**被字节级重放一次（重放向量走全真路径）。
+/// c→s side: the **first sealed record** after the I1 is replayed once at
+/// the byte level (the replay vector goes through the fully real path).
 async fn replay_proxy(client_side: DuplexStream, server_side: DuplexStream) {
     let (mut c_rd, mut c_wr) = tokio::io::split(client_side);
     let (mut s_rd, mut s_wr) = tokio::io::split(server_side);
-    // s→c 透明（读服务端 → 写客户端）
+    // s→c transparent (read server → write client)
     {
         tokio::spawn(async move {
             let _ = tokio::io::copy(&mut s_rd, &mut c_wr).await;
         });
     }
-    // c→s：逐帧转发，第 2 帧（i==1，首条已封记录）额外重放一次
+    // c→s: forward frame by frame; the 2nd frame (i==1, the first sealed
+    // record) is additionally replayed once
     tokio::spawn(async move {
         for i in 0.. {
             let mut hdr = [0u8; 5];
@@ -1051,7 +1121,7 @@ async fn replay_proxy(client_side: DuplexStream, server_side: DuplexStream) {
             let _ = s_wr.write_all(&hdr).await;
             let _ = s_wr.write_all(&body).await;
             if i == 1 {
-                // ← 字节级重放同一条已封记录
+                // ← byte-level replay of the same sealed record
                 let _ = s_wr.write_all(&hdr).await;
                 let _ = s_wr.write_all(&body).await;
             }
@@ -1092,7 +1162,8 @@ async fn replayed_record_rejected_and_counted() {
     });
     let (client, server) = (cli.await.expect("cli"), srv.await.expect("srv"));
 
-    // 客户端发流数据（其首条记录被 proxy 重放）
+    // The client sends stream data (whose first record the proxy
+    // replays)
     let mut cs = client.open_stream(Prio::Normal).await.expect("open");
     cs.write_all(b"payload-under-replay-probe")
         .await
@@ -1105,13 +1176,20 @@ async fn replayed_record_rejected_and_counted() {
     ss.read_exact(&mut buf).await.expect("r");
     assert_eq!(&buf, b"payload-under-replay-probe");
 
-    wait_until("重放被计", || server.stats().replay_rejected >= 1).await;
+    wait_until("replay counted", || server.stats().replay_rejected >= 1).await;
     let st = server.stats();
-    assert!(st.forge_attempts >= 1, "重放计入伪造（P0-2）");
-    assert_eq!(st.replay_rejected, 1, "字节级重复识别为重放");
-    assert!(st.closed.is_none(), "单次重放不断链");
+    assert!(
+        st.forge_attempts >= 1,
+        "the replay counts as forgery (P0-2)"
+    );
+    assert_eq!(
+        st.replay_rejected, 1,
+        "byte-level duplicate recognized as replay"
+    );
+    assert!(st.closed.is_none(), "a single replay does not tear down");
 
-    // 数据面继续可用（被拒的重复记录不影响后续真记录）
+    // The data plane stays usable (the rejected duplicate does not
+    // affect subsequent genuine records)
     cs.write_all(b"after replay").await.expect("w2");
     let mut buf2 = [0u8; 12];
     ss.read_exact(&mut buf2).await.expect("r2");
@@ -1122,16 +1200,18 @@ async fn replayed_record_rejected_and_counted() {
 }
 
 // ============================================================================
-// 服务端目录接缝的异步性（BoxFuture，§7-M1）
+// Asynchrony of the server directory seam (BoxFuture, §7-M1)
 // ============================================================================
 
 // ============================================================================
-// rekey 切换竞态回归向量（blocking 复核修复）
+// rekey switch race regression vectors (blocking-review fix)
 // ============================================================================
 
-/// 帧感知批到达代理（复核实验的确定性复现形态）：s→c 逐帧转发，但 REKEY_RESP 帧与其后
-/// 3 帧合并为**一次** write 到达（TCP 无帧边界，Nagle/内核缓冲合并合法且常见）；
-/// c→s 透明。
+/// Frame-aware batch-arrival proxy (a deterministic reproduction of the
+/// review experiment): s→c forwards frame by frame, but the REKEY_RESP
+/// frame and the 3 frames after it are merged into **one** write (TCP
+/// has no frame boundaries; Nagle/kernel-buffer merging is legal and
+/// common); c→s transparent.
 async fn batch_resp_proxy(client_side: DuplexStream, server_side: DuplexStream) {
     let (mut c_rd, mut c_wr) = tokio::io::split(client_side);
     let (mut s_rd, mut s_wr) = tokio::io::split(server_side);
@@ -1151,10 +1231,16 @@ async fn batch_resp_proxy(client_side: DuplexStream, server_side: DuplexStream) 
                 return;
             }
             if !batched && hdr[4] == RT_REKEY_RESP {
-                // RESP + 后续帧（至多 3 帧，每帧限时 100ms 到达）拼成一个缓冲一次写出
-                // （同批到达）。限时是必须的：对端 bulk 已发尽时后续帧永不到来，
-                // 无条件 read_exact 会把 RESP 永久扣住 ⇒ 发起方 epoch 卡 0（门禁 flake
-                // 的实测签名）；100ms 窗口在持续流量下足以收齐、静默对端下退化为单帧。
+                // The RESP + subsequent frames (at most 3, each with a
+                // 100ms arrival window) are glued into one buffer and
+                // written out once (same-batch arrival). The deadline is
+                // necessary: when the peer's bulk traffic is exhausted,
+                // later frames never arrive, and an unconditional
+                // read_exact would hold the RESP forever ⇒ the
+                // initiator's epoch stuck at 0 (the empirically observed
+                // signature of a gate flake); a 100ms window is enough
+                // to gather under sustained traffic and degenerates to a
+                // single frame against a silent peer.
                 let mut buf = Vec::new();
                 buf.extend_from_slice(&hdr);
                 buf.extend_from_slice(&body);
@@ -1185,7 +1271,8 @@ async fn batch_resp_proxy(client_side: DuplexStream, server_side: DuplexStream) 
     });
 }
 
-/// 双向数据泵：`total` 个 chunk（前 4B = LE 序号）。
+/// Bidirectional data pump: `total` chunks (first 4B = LE sequence
+/// number).
 async fn bulk_send(mut s: flock_protocol::mux::Stream, total: usize, chunk: usize) {
     for i in 0..total {
         let mut b = vec![(i % 251) as u8; chunk];
@@ -1194,7 +1281,8 @@ async fn bulk_send(mut s: flock_protocol::mux::Stream, total: usize, chunk: usiz
     }
 }
 
-/// 收全 `total` 个 chunk：返回（收到字节数, 序号全覆盖）。
+/// Receive all `total` chunks: returns (bytes received, full sequence
+/// coverage).
 async fn bulk_recv(
     mut s: flock_protocol::mux::Stream,
     total: usize,
@@ -1221,9 +1309,13 @@ const BULK_CHUNK_LEN: usize = 16 * 1024;
 
 #[tokio::test]
 async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
-    // 复核实验的确定性复现：REKEY_RESP 与新纪元记录同批到达。修复前：读泵在写泵应用
-    // RESP 前抢先读入新纪元记录 ⇒ 旧钥解新钥 ⇒ 误判伪造 + 静默丢数据 + 计数器错位。
-    // 修复后（RESP 应用在读泵同步执行）：零伪造、零丢失、双向数据完整。
+    // Deterministic reproduction of the review experiment: the
+    // REKEY_RESP arrives batched with new-epoch records. Before the fix:
+    // the read pump read new-epoch records ahead of the write pump
+    // applying the RESP ⇒ old key opening the new key ⇒ misjudged as
+    // forgery + silently dropped data + counter misalignment. After the
+    // fix (RESP application runs synchronously in the read pump): zero
+    // forgeries, zero loss, bidirectional data intact.
     let fix = fixture();
     let device = DeviceStaticKeys::generate();
     let mut dir = InMemoryDirectory::new();
@@ -1233,7 +1325,7 @@ async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
     let clock_for_cfg = clock.clone();
     let mk_cfg = move || TunnelConfig {
         clock: clock_for_cfg.clone(),
-        keepalive: Duration::from_secs(3600), // 隔离死链判定（注入时钟一次前拨 121s）
+        keepalive: Duration::from_secs(3600), // isolate the dead-link verdict (the injected clock jumps 121s at once)
         ..TunnelConfig::default()
     };
 
@@ -1266,11 +1358,13 @@ async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
     let client = cli.await.expect("cli");
     let server = srv.await.expect("srv");
 
-    // 双向流：bulk 首块即携 yamux SYN（SYN 惰性），accept 与发送并发
+    // Bidirectional streams: the first bulk chunk carries the yamux SYN
+    // (lazy SYN); accept and send run concurrently
     let cs = client.open_stream(Prio::Normal).await.expect("c stream");
     let ss2 = server.open_stream(Prio::Normal).await.expect("s stream2");
 
-    // 双向大流量写入（后台），中途触发 rekey
+    // Bidirectional heavy writes (in the background), triggering a rekey
+    // midway
     let w1 = tokio::spawn(bulk_send(cs, BULK_CHUNKS, BULK_CHUNK_LEN));
     let w2 = tokio::spawn(bulk_send(ss2, BULK_CHUNKS, BULK_CHUNK_LEN));
     let ss = tokio::time::timeout(Duration::from_secs(10), server.accept_stream())
@@ -1281,8 +1375,8 @@ async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
         .await
         .expect("t2")
         .expect("c stream2");
-    tokio::time::sleep(Duration::from_millis(300)).await; // 流量进行中
-    clock.advance(Duration::from_secs(121)); // 触发 rekey（RESP 批到达竞态窗口）
+    tokio::time::sleep(Duration::from_millis(300)).await; // traffic in flight
+    clock.advance(Duration::from_secs(121)); // trigger the rekey (the RESP batch-arrival race window)
     let (r1_bytes, r1_full) = tokio::time::timeout(
         Duration::from_secs(30),
         bulk_recv(ss, BULK_CHUNKS, BULK_CHUNK_LEN),
@@ -1298,38 +1392,53 @@ async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
     w1.await.expect("w1");
     w2.await.expect("w2");
 
-    // rekey 完成 + 竞态断言：零伪造、零重放误判、双向零丢失
-    wait_until("双侧 epoch → 1", || {
+    // Rekey complete + race assertions: zero forgeries, zero replay
+    // misjudgments, zero bidirectional loss
+    wait_until("both epochs → 1", || {
         client.stats().epoch == 1 && server.stats().epoch == 1
     })
     .await;
     let cst = client.stats();
     let sst = server.stats();
-    assert_eq!(cst.forge_attempts, 0, "客户端零伪造（RESP 批到达不得误判）");
-    assert_eq!(sst.forge_attempts, 0, "服务端零伪造");
+    assert_eq!(
+        cst.forge_attempts, 0,
+        "client zero forgeries (RESP batch arrival must not misjudge)"
+    );
+    assert_eq!(sst.forge_attempts, 0, "server zero forgeries");
     assert_eq!(cst.replay_rejected, 0);
     assert_eq!(sst.replay_rejected, 0);
-    assert!(cst.closed.is_none() && sst.closed.is_none(), "会话存活");
+    assert!(
+        cst.closed.is_none() && sst.closed.is_none(),
+        "session alive"
+    );
     assert_eq!(
         r1_bytes,
         BULK_CHUNKS * BULK_CHUNK_LEN,
-        "c→s 全量到达（无静默丢弃）"
+        "c→s full arrival (no silent drops)"
     );
-    assert_eq!(r2_bytes, BULK_CHUNKS * BULK_CHUNK_LEN, "s→c 全量到达");
-    assert!(r1_full && r2_full, "序号全覆盖（无乱序/丢失）");
+    assert_eq!(r2_bytes, BULK_CHUNKS * BULK_CHUNK_LEN, "s→c full arrival");
+    assert!(
+        r1_full && r2_full,
+        "full sequence coverage (no reordering/loss)"
+    );
 
     client.shutdown().await;
     server.shutdown().await;
 }
 
 // ============================================================================
-// M5 A8：单隧道 100 并发 yamux 流持续 60s 无错（R11——单隧道多会话复用的承载上限）
+// M5 A8: 100 concurrent yamux streams on a single tunnel sustained for
+// 60s without errors (R11 — the carrying capacity of multi-stream reuse
+// on one tunnel)
 // ============================================================================
 
-/// 100 条并发 yamux 流在同一条会话隧道上持续收发（缺省 60s；`A8_SECS` 可调便于本地
-/// 快跑，M5 断言按缺省 60s 执行）。通过标准：全部流建立、每条流双向字节数严格一致、
-/// 隧道无错不断（epoch/rekey 不影响数据面）。
-#[ignore = "M5 A8 断言入口（60s 持续档不进缺省套件）：deploy/e2e_assert.sh 以 --ignored 运行"]
+/// 100 concurrent yamux streams send and receive continuously over one
+/// session tunnel (default 60s; `A8_SECS` is adjustable for quick local
+/// runs; the M5 assertion runs at the default 60s). Pass criteria: all
+/// streams established, every stream's bidirectional byte counts
+/// strictly equal, the tunnel error-free and unbroken (epoch/rekeys do
+/// not disturb the data plane).
+#[ignore = "M5 A8 assertion entry (the 60s sustained tier is not in the default suite): deploy/e2e_assert.sh runs it with --ignored"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hundred_streams_sixty_seconds_sustained() {
     let secs: u64 = std::env::var("A8_SECS")
@@ -1338,12 +1447,14 @@ async fn hundred_streams_sixty_seconds_sustained() {
         .unwrap_or(60);
     let streams: usize = 100;
     let chunk: usize = 4096;
-    // 每流每秒发一轮（100 流 × 4KiB/s = ~400KiB/s 总量——持续而不过载）。
+    // One round per stream per second (100 streams × 4KiB/s = ~400KiB/s
+    // total — sustained without overload).
     let rounds_target = secs as usize;
 
     let (client, server) = session_pair().await;
 
-    // 服务端：收 100 条流（accept 循环），每条流回显收到的每个 chunk。
+    // Server: accept 100 streams (accept loop); each stream echoes every
+    // chunk it receives.
     let srv = tokio::spawn(async move {
         let mut seen = 0usize;
         let mut echoers = Vec::new();
@@ -1352,20 +1463,26 @@ async fn hundred_streams_sixty_seconds_sustained() {
             echoers.push(tokio::spawn(async move {
                 let mut s = s;
                 let mut buf = vec![0u8; chunk];
-                // 回显泵：读到即回写；读错/写错 = 流结束（对端 FIN/会话拆）。
+                // Echo pump: read then write back; a read/write error =
+                // stream end (peer FIN/session teardown).
                 while s.read_exact(&mut buf).await.is_ok() && s.write_all(&buf).await.is_ok() {}
             }));
             if seen == streams {
                 break;
             }
         }
-        assert_eq!(seen, streams, "服务端应收到全部 {streams} 条流");
+        assert_eq!(
+            seen, streams,
+            "the server should receive all {streams} streams"
+        );
         for e in echoers {
             let _ = e.await;
         }
     });
 
-    // 客户端：100 条流并发，每条按秒级节奏发 chunk、收回显、校验序号连续。
+    // Client: 100 concurrent streams, each sending chunks at a
+    // second-level cadence, receiving the echo, and checking sequence
+    // continuity.
     let mut drivers = Vec::new();
     for i in 0..streams {
         let stream = client.open_stream(Prio::Normal).await.expect("open stream");
@@ -1392,18 +1509,20 @@ async fn hundred_streams_sixty_seconds_sustained() {
     let mut total_bytes = 0usize;
     for d in drivers {
         let (n, ok) = d.await.expect("driver");
-        assert!(ok, "回显序号必须连续");
+        assert!(ok, "echo sequence numbers must be continuous");
         total_bytes += n;
     }
-    // 结束：拆会话（服务端 echo 任务随会话结束退出）。
+    // Finish: tear down the session (the server echo tasks exit with the
+    // session).
     drop(client);
     let _ = tokio::time::timeout(Duration::from_secs(10), srv).await;
 
-    // 通过面：100 流 × {secs}s × 4KiB 双向全部完成、隧道未因错误断开。
+    // Pass surface: 100 streams × {secs}s × 4KiB bidirectional all
+    // completed, the tunnel not torn down by errors.
     assert_eq!(
         total_bytes,
         streams * rounds_target * chunk,
-        "总发送字节精确匹配（无丢失/无重复）"
+        "total sent bytes match exactly (no loss/no duplication)"
     );
-    eprintln!("A8: {streams} streams × {secs}s × {chunk}B 双向 = {total_bytes}B OK");
+    eprintln!("A8: {streams} streams × {secs}s × {chunk}B bidirectional = {total_bytes}B OK");
 }

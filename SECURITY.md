@@ -2,41 +2,55 @@
 
 ## Reporting a Vulnerability
 
-flock-protocol 是加密协议库，安全报告优先于一切普通 issue。
+flock-protocol is a cryptographic protocol library; security reports
+take precedence over all ordinary issues.
 
-**请勿通过公开 issue、PR、讨论区或任何公开渠道报告安全漏洞。**
+**Please do not report security vulnerabilities through public issues,
+PRs, discussion boards, or any public channel.**
 
-请使用 GitHub 私有漏洞报告渠道：
+Use GitHub's private vulnerability reporting channel:
 
-1. 打开本仓库页面，进入 **Security** 标签页；
-2. 选择 **Report a vulnerability**（私有漏洞报告）；
-3. 按模板描述：受影响版本、攻击前提、影响面、复现步骤（如有 PoV 请附在报告内，
-   报告本身非公开）。
+1. Open this repository's page and go to the **Security** tab;
+2. Choose **Report a vulnerability** (private vulnerability reporting);
+3. Describe per the template: affected versions, attack preconditions,
+   impact scope, reproduction steps (attach a PoV inside the report if
+   you have one; the report itself is non-public).
 
-GitHub 私有漏洞报告通道说明：<https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability>
+GitHub private vulnerability reporting docs:
+<https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability>
 
-如该渠道不可用（例如仓库尚未启用），可联系维护者邮箱（见仓库 About 或 README），
-邮件主题前缀 `[security]`。
+If that channel is unavailable (e.g. the repository has not enabled it),
+contact the maintainer email (see the repository About or README), with
+the subject prefixed `[security]`.
 
-### 期望的响应节奏
+### Expected response cadence
 
-- **确认收到**：3 个工作日内；
-- **初步评估**（是否接受、影响面定级）：7 个工作日内；
-- **修复与公告**：按严重度排期，修复随常规版本发布，同步发布
-  GitHub Security Advisory（CVE 编号按需申请）。
+- **Acknowledgment**: within 3 business days;
+- **Initial assessment** (accept/reject, impact rating): within 7
+  business days;
+- **Fix and advisory**: scheduled by severity; fixes ship with regular
+  releases, accompanied by a GitHub Security Advisory (CVE IDs requested
+  as needed).
 
-请给予我们合理的修复窗口后再公开细节；我们承诺对善意报告者不追究
-（不诉诸法律手段）。
+Please give us a reasonable fix window before disclosing details; we
+commit to not pursuing action against good-faith reporters (no legal
+recourse).
 
-## 报告范围
+## Scope
 
-- 本 crate（src/、tests/、benches/）中的密码学构造、协议逻辑与实现缺陷；
-- 依赖项的已知漏洞波及本 crate 的部分（请同时报告，我们通过常规渠道跟进升级）。
+- Cryptographic constructions, protocol logic, and implementation flaws
+  in this crate (src/, tests/, benches/);
+- Parts of known dependency vulnerabilities that affect this crate
+  (please report those too; we follow up with upgrades through the
+  regular channels).
 
-不在范围内：需要物理接触或已控制操作系统的攻击面、理论性无现实前提的攻击、
-DoS 类资源耗尽（除非可远程以极小成本触发且影响隧道可用性）。
+Out of scope: attack surfaces requiring physical access or an already
+compromised OS, theoretical attacks with no realistic preconditions,
+DoS-style resource exhaustion (unless triggerable remotely at negligible
+cost in a way that affects tunnel availability).
 
-## 公告渠道
+## Advisory channel
 
-安全修复公告通过 GitHub **Security Advisories** 发布（仓库 Security 标签页），
-并同步到对应 release notes。
+Security-fix advisories are published via GitHub **Security Advisories**
+(the repository's Security tab), and mirrored into the corresponding
+release notes.

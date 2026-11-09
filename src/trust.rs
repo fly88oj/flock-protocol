@@ -1,27 +1,47 @@
-//! 首登信任锚（docs/design.md §1.3.3(f) / §3.8，P0-5）。
+//! First-login trust anchors (docs/design.md §1.3.3(f) / §3.8, P0-5).
 //!
-//! 钉扎模型（第三轮评审定型，方案②）：客户端锚定**集群根公钥**，持根签
-//! [`ClusterDirectory`]（全套 [`ServerEntry`] = 入群凭证公开部分；端点列表与条目**同一份
-//! 签名**覆盖，防「列表真、条目假」的拼接）。任意端点 1-RTT（I1 的 ML-KEM ct 封装给该端点
-//! ServerEntry 的静态混合公钥）；单台换钥 = 根签新目录（dir_version 递增）+ 客户端
-//! dir_pull 刷新；换端点/新服务器**不出现 I0**。
+//! Pinning model (finalized in the third review round, option 2): the
+//! client anchors the **cluster root public key** and holds the
+//! root-signed [`ClusterDirectory`] (the full set of [`ServerEntry`] =
+//! the public part of the join credentials; the endpoint list and the
+//! entries are covered by **one and the same signature**, preventing
+//! "true list, fake entries" splicing). Any endpoint gives 1-RTT (I1's
+//! ML-KEM ct is encapsulated to that endpoint ServerEntry's static
+//! hybrid public key); rotating one server's key = a root-signed new
+//! directory (dir_version increments) + a client dir_pull refresh;
+//! switching endpoints or adding servers **never produces I0**.
 //!
-//! - [`PinStore`]：钉扎粒度 = `cluster_id → 集群根公钥`（known_hosts 语义，集群根级；
-//!   服务器级材料不单独 TOFU——由根签名背书）。根公钥变更 = [`PinVerdict::Mismatch`]
-//!   （携带新旧两把公钥，显式告警数据源，**不可静默跳过**）。文件适配器首发
-//!   （[`PinStore::save`]/[`PinStore::load`]，unix 下 0600）；钥匙库适配器给移动端（接缝）。
-//! - [`InviteFile`] v3：根签 ClusterDirectory 全套服务器材料 + 一次性 invite_id + expiry
-//!   （默认 7 天，§2.4）。**v1 指纹-only 与 v2 单服务器材料不再接受**——多服务器集群下
-//!   无法支撑任意端点 1-RTT（§3.8）。invite_id 单次消费语义由本仓 sync crate 的 Raft 状态机
-//!   保证（redeem_invite 查重，§4）；本模块只做结构校验。
-//! - [`ClusterDirectory`]：dir_version 单调递增；`PinStore::record_directory` 是
-//!   dir_pull 刷新的落地路径（根验签 + 钉扎比对 + 版本回退拒收）。
+//! - [`PinStore`]: pinning granularity = `cluster_id → cluster root
+//!   public key` (known_hosts semantics, cluster-root level;
+//!   server-level material is not separately TOFU'd — it is endorsed by
+//!   the root signature). A root public key change = a
+//!   [`PinVerdict::Mismatch`] (carrying both the old and new keys,
+//!   explicitly surfacing the data source, **must not be silently
+//!   skipped**). The file adapter ships first
+//!   ([`PinStore::save`]/[`PinStore::load`], 0600 on unix); a keystore
+//!   adapter for mobile follows (seam).
+//! - [`InviteFile`] v3: a root-signed ClusterDirectory with the full
+//!   server material + a one-time invite_id + expiry (default 7 days,
+//!   §2.4). **v1 fingerprint-only and v2 single-server-material invites
+//!   are no longer accepted** — under a multi-server cluster they cannot
+//!   support 1-RTT to any endpoint (§3.8). The invite_id single-use
+//!   semantics are guaranteed by this repository's sync crate's Raft
+//!   state machine (redeem_invite dedup, §4); this module does only
+//!   structural validation.
+//! - [`ClusterDirectory`]: dir_version monotonically increasing;
+//!   `PinStore::record_directory` is the landing path for dir_pull
+//!   refreshes (root-signature verification + pin comparison + version
+//!   rollback rejection).
 //!
-//! # 残余风险声明（不可静默，§1.3.3f/§2.5-3）
+//! # Residual-risk statement (must not be silent, §1.3.3f/§2.5-3)
 //!
-//! **TOFU 不防首登在线 MITM**：首连时攻击者可自签一套「根公钥+凭证链」，客户端把攻击者
-//! 的根钉住（SSH known_hosts 同类限制，verdict §3.9 攻击只被部分关闭）。组织场景必须走
-//! 邀请文件强路径；TOFU 首连的根指纹确认 UI 不得静默。
+//! **TOFU does not defend against an online MITM at first login**: on
+//! first connect an attacker can self-sign a whole "root public key +
+//! credential chain", and the client pins the attacker's root (the same
+//! class of limitation as SSH known_hosts; verdict §3.9 — the attack is
+//! only partially closed). Organizational settings must go through the
+//! strong invite-file path; the TOFU first-connect root-fingerprint
+//! confirmation UI must not be silent.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -30,45 +50,54 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
-// 会话层已定义的接入材料类型（同一凭证两用：服务器互认 §4 / 客户端接入材料，§1.3.3f）
-// 与共享解析游标 Rd（ponytail：消除与 session 逐一同构的复刻）
+// Access-material types already defined by the session layer (one
+// credential, two uses: server mutual-recognition §4 / client access
+// material, §1.3.3f) and the shared parse cursor Rd (ponytail: removes
+// the copies that used to duplicate session's, field for field)
 pub use crate::session::{
     fingerprint_ed25519, sign_server_entry, verify_server_entry, ClusterId, ServerEntry, ServerId,
     ServerPin,
 };
 use crate::session::{Rd, RdErr};
 
-/// 邀请文件版本（v3；v1/v2 拒收）。
+/// Invite file version (v3; v1/v2 rejected).
 pub const INVITE_VERSION: u8 = 3;
-/// 目录结构版本。
+/// Directory structure version.
 pub const DIRECTORY_VERSION: u8 = 1;
-/// 邀请默认有效期：7 天（§1.3.3f「默认 7 天（可配）」）。
+/// Invite default validity: 7 days (§1.3.3f "default 7 days
+/// (configurable)").
 pub const INVITE_DEFAULT_TTL_SECS: u64 = 7 * 24 * 3600;
 
 const SIG_DIRECTORY: &[u8] = b"flock-protocol/trust/cluster-directory/v1";
 const SIG_INVITE: &[u8] = b"flock-protocol/trust/invite/v3";
 
-/// 信任层错误。
+/// Trust-layer error.
 #[derive(Debug)]
 pub enum TrustError {
-    /// 底层 IO。
+    /// Underlying IO.
     Io(io::Error),
-    /// 根签名校验失败（根签名不匹配/条目被篡改/字节损坏）。
+    /// Root signature verification failed (root signature mismatch /
+    /// entries tampered / bytes corrupted).
     BadSignature,
-    /// 邀请文件版本不受支持（v1/v2 拒收；字节为文件内版本）。
+    /// Unsupported invite file version (v1/v2 rejected; the byte is the
+    /// in-file version).
     UnsupportedInviteVersion(u8),
-    /// 邀请已过期。
+    /// Invite expired.
     Expired { now_unix: u64, expiry_unix: u64 },
-    /// 集群根公钥变更（显式告警路径：携带钉扎值与呈现值，不可静默）。
-    /// 两把公钥盒装（Err 载荷尺寸纪律；内容为公钥，堆分配无敏感面）。
+    /// Cluster root public key changed (explicit alert path: carries the
+    /// pinned value and the presented value; must not be silent). Both
+    /// keys boxed (Err payload size discipline; contents are public keys,
+    /// heap allocation carries no sensitive surface).
     RootChanged {
         cluster_id: ClusterId,
         pinned: Box<VerifyingKey>,
         presented: Box<VerifyingKey>,
     },
-    /// 目录版本回退（dir_version 必须单调递增；stored=已见版本，got=本次版本）。
+    /// Directory version rollback (dir_version must increase
+    /// monotonically; stored = the previously seen version, got = this
+    /// version).
     DirVersionRollback { stored: u64, got: u64 },
-    /// 编码违约（长度/字段缺失/尾随字节）。
+    /// Encoding violation (lengths/missing fields/trailing bytes).
     Encoding(&'static str),
 }
 
@@ -115,26 +144,31 @@ impl From<io::Error> for TrustError {
 }
 
 // ============================================================================
-// ClusterDirectory（根签目录：端点列表与条目同签，§1.3.3f 方案②）
+// ClusterDirectory (root-signed directory: endpoint list and entries
+// co-signed, §1.3.3f option 2)
 // ============================================================================
 
-/// 根签集群目录：全套服务器接入材料 + 单调递增 dir_version。
+/// Root-signed cluster directory: the full server access material +
+/// monotonically increasing dir_version.
 ///
-/// 签名覆盖 `cluster_id ‖ dir_version ‖ 服务器数 ‖ 全部 ServerEntry 字段`——
-/// 「列表真、条目假」的拼接在验签处失败。
+/// The signature covers `cluster_id ‖ dir_version ‖ server count ‖ all
+/// ServerEntry fields` — "true list, fake entries" splicing fails at
+/// verification.
 #[derive(Debug, Clone)]
 pub struct ClusterDirectory {
-    /// 所属集群。
+    /// Owning cluster.
     pub cluster_id: ClusterId,
-    /// 递增版本（单台换钥 ⇒ 根签新目录 ⇒ 客户端 dir_pull 刷新；回退拒收）。
+    /// Increasing version (one server rotating keys ⇒ a root-signed new
+    /// directory ⇒ client dir_pull refresh; rollbacks rejected).
     pub dir_version: u64,
-    /// 全套服务器接入材料。
+    /// The full server access material.
     pub servers: Vec<ServerEntry>,
-    /// 集群根密钥对 canonical_bytes 的签名。
+    /// The root key's signature over canonical_bytes.
     pub root_sig: Signature,
 }
 
-/// ServerEntry 字段编码（不含域分离标签；目录/邀请内嵌用）。
+/// ServerEntry field encoding (without the domain-separation label; for
+/// embedding inside directories/invites).
 fn entry_fields(e: &ServerEntry, out: &mut Vec<u8>) {
     out.extend_from_slice(&e.server_id.0);
     out.extend_from_slice(&(e.relay_endpoint.len() as u16).to_le_bytes());
@@ -144,7 +178,8 @@ fn entry_fields(e: &ServerEntry, out: &mut Vec<u8>) {
 }
 
 impl ClusterDirectory {
-    /// 签名覆盖的规范化字节（不含 root_sig 本身）。
+    /// Canonical bytes covered by the signature (excluding root_sig
+    /// itself).
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(SIG_DIRECTORY.len() + 24 + self.servers.len() * 1300);
         v.extend_from_slice(SIG_DIRECTORY);
@@ -157,7 +192,8 @@ impl ClusterDirectory {
         v
     }
 
-    /// 根密钥签发（运维/测试装配路径；根密钥离线保管，§4）。
+    /// Issue with the root key (ops/test assembly path; the root key is
+    /// kept offline, §4).
     pub fn issue(
         root: &SigningKey,
         cluster_id: ClusterId,
@@ -174,14 +210,15 @@ impl ClusterDirectory {
         dir
     }
 
-    /// 根公钥验签（条目被篡改 ⇒ 失败；换根 ⇒ 失败）。
+    /// Verify with the root public key (entries tampered ⇒ fails; root
+    /// swapped ⇒ fails).
     pub fn verify(&self, root_pub: &VerifyingKey) -> bool {
         root_pub
             .verify(&self.canonical_bytes(), &self.root_sig)
             .is_ok()
     }
 
-    /// 按 server_id 查端点材料。
+    /// Look up endpoint material by server_id.
     pub fn find(&self, server_id: &ServerId) -> Option<&ServerEntry> {
         self.servers.iter().find(|e| &e.server_id == server_id)
     }
@@ -197,15 +234,17 @@ impl ClusterDirectory {
         out.extend_from_slice(&self.root_sig.to_bytes());
     }
 
-    /// 序列化（dir_pull 下发线格式，§3.8/§3.11；`[ver][cluster][dir_version][n]{entries}
-    /// [root_sig]`）。与 `InviteFile::to_bytes` 内嵌目录段同构。
+    /// Serialize (the dir_pull delivery wire format, §3.8/§3.11;
+    /// `[ver][cluster][dir_version][n]{entries}[root_sig]`). Isomorphic
+    /// with the embedded directory segment of `InviteFile::to_bytes`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(17 + self.servers.len() * 1300);
         self.encode(&mut v);
         v
     }
 
-    /// 反序列化（结构级；根验签走 [`ClusterDirectory::verify`]）。
+    /// Deserialize (structural; root-signature verification goes through
+    /// [`ClusterDirectory::verify`]).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, TrustError> {
         let mut rd = Rd::new(bytes);
         let dir = Self::decode(&mut rd)?;
@@ -263,23 +302,29 @@ impl ClusterDirectory {
 // InviteFile v3
 // ============================================================================
 
-/// 邀请文件 v3（§1.3.3f）：根签 ClusterDirectory 全套服务器材料 + 一次性 invite_id +
-/// expiry。持邀请客户端对任意端点（含切换/迁移）直接 1-RTT，完全避开 TOFU。
+/// Invite file v3 (§1.3.3f): a root-signed ClusterDirectory with the
+/// full server material + one-time invite_id + expiry. An invited client
+/// gets 1-RTT directly to any endpoint (including after switches/
+/// migrations), fully avoiding TOFU.
 #[derive(Debug, Clone)]
 pub struct InviteFile {
-    /// 根签集群目录。
+    /// The root-signed cluster directory.
     pub directory: ClusterDirectory,
-    /// 集群根公钥（信任锚本体；与签发根成对）。
+    /// Cluster root public key (the trust anchor itself; paired with the
+    /// issuing root).
     pub cluster_root_pub: VerifyingKey,
-    /// 过期时刻（unix 秒；默认签发 +7 天）。
+    /// Expiry instant (unix seconds; default issue + 7 days).
     pub expiry_unix: u64,
-    /// 一次性消费凭据标识（进 Raft 状态机查重；库内仅结构校验）。
+    /// One-time consumption credential identifier (deduplicated in the
+    /// Raft state machine; structural validation only inside this
+    /// library).
     pub invite_id: [u8; 16],
-    /// 根密钥签名，覆盖 directory 规范字节 ‖ root_pub ‖ expiry ‖ invite_id。
+    /// Root-key signature covering the directory canonical bytes ‖
+    /// root_pub ‖ expiry ‖ invite_id.
     pub root_sig: Signature,
 }
 
-/// 当前 unix 秒。
+/// Current unix seconds.
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -288,7 +333,8 @@ pub fn now_unix() -> u64 {
 }
 
 impl InviteFile {
-    /// 根密钥签发（expiry 建议 now + [`INVITE_DEFAULT_TTL_SECS`]）。
+    /// Issue with the root key (expiry recommended now +
+    /// [`INVITE_DEFAULT_TTL_SECS`]).
     pub fn issue(
         root: &SigningKey,
         cluster_id: ClusterId,
@@ -309,7 +355,8 @@ impl InviteFile {
         inv
     }
 
-    /// 签名覆盖的规范化字节（不含 root_sig 本身）。
+    /// Canonical bytes covered by the signature (excluding root_sig
+    /// itself).
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut v = self.directory.canonical_bytes();
         v.extend_from_slice(SIG_INVITE);
@@ -319,8 +366,11 @@ impl InviteFile {
         v
     }
 
-    /// 结构自洽验签（root_sig 对 canonical_bytes；任何字段篡改 ⇒ 失败）。
-    /// 防冒（根替换）需调用方比对钉扎/展示根指纹——见 [`InviteFile::verify_against`]。
+    /// Structural self-consistency verification (root_sig over
+    /// canonical_bytes; any field tampered ⇒ fails). Anti-impersonation
+    /// (root substitution) requires the caller to compare against the
+    /// pinned/displayed root fingerprint — see
+    /// [`InviteFile::verify_against`].
     pub fn verify(&self) -> bool {
         self.cluster_root_pub
             .verify(&self.canonical_bytes(), &self.root_sig)
@@ -328,12 +378,14 @@ impl InviteFile {
             && self.directory.verify(&self.cluster_root_pub)
     }
 
-    /// 对照外部已知根公钥验签（已钉扎/管理员分发的根）。
+    /// Verify against an externally known root public key (pinned / an
+    /// administrator-distributed root).
     pub fn verify_against(&self, known_root: &VerifyingKey) -> bool {
         self.cluster_root_pub == *known_root && self.verify()
     }
 
-    /// 版本/过期检查（now 由调用方注入，可测）。
+    /// Version/expiry check (now is injected by the caller, keeping it
+    /// testable).
     pub fn check(&self, now_unix: u64) -> Result<(), TrustError> {
         if self.expiry_unix <= now_unix {
             return Err(TrustError::Expired {
@@ -344,7 +396,8 @@ impl InviteFile {
         Ok(())
     }
 
-    /// 序列化（邀请文件按一次性凭据管理：0600 落盘由 [`save_invite`] 承担）。
+    /// Serialize (invite files are managed as one-time credentials: 0600
+    /// persistence is handled by [`save_invite`]).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(64 + self.directory.servers.len() * 1300);
         v.push(INVITE_VERSION);
@@ -356,7 +409,9 @@ impl InviteFile {
         v
     }
 
-    /// 反序列化（含 v3 版本检查与结构自洽验签：根签名不匹配/条目被篡改 ⇒ 拒）。
+    /// Deserialize (including the v3 version check and structural
+    /// self-consistency verification: root signature mismatch / entries
+    /// tampered ⇒ rejected).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, TrustError> {
         let mut rd = Rd::new(bytes);
         let ver = rd.u8()?;
@@ -387,10 +442,14 @@ impl InviteFile {
     }
 }
 
-/// 凭据类文件 0600 落盘（compat::write_private 同款姿势）：unix 下以
-/// `OpenOptions::mode(0o600)` **创建**——文件诞生即 0600，不存在「先写后收紧」
-/// 的权限窗口（`fs::write` + `set_permissions` 之间存在偏宽窗口）。覆盖已存在
-/// 文件偏宽旧权限时事后收紧。Windows 原生无 POSIX 权限位，退化为常规写。
+/// 0600 persistence for credential-class files (same posture as
+/// compat::write_private): on unix, **created** via
+/// `OpenOptions::mode(0o600)` — the file is 0600 from birth, with no
+/// "write first, tighten later" permission window (between `fs::write`
+/// and `set_permissions` there is an overly permissive window). When
+/// overwriting an existing file's overly permissive old permissions,
+/// they are tightened afterwards. Native Windows has no POSIX permission
+/// bits and falls back to an ordinary write.
 fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -405,7 +464,8 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .open(path)?;
         f.write_all(bytes)?;
         f.flush()?;
-        // 覆盖已存在文件可能偏宽的旧权限（创建路径本身无窗口）。
+        // Tighten possibly overly permissive old permissions of an
+        // existing file (the creation path itself has no window).
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
@@ -415,63 +475,76 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-/// 保存邀请文件（unix 下 0600——按一次性凭据管理，§1.3.3f 邀请一生）。
+/// Save an invite file (0600 on unix — managed as a one-time credential,
+/// §1.3.3f invite lifetime).
 pub fn save_invite(path: &Path, invite: &InviteFile) -> Result<(), TrustError> {
     write_private_file(path, &invite.to_bytes())?;
     Ok(())
 }
 
-/// 加载邀请文件（§1.3.3f `load_invite(path)`：读盘 + v3 版本检查 + 结构验签；
-/// 过期/外部根比对由调用方带上下文执行 [`InviteFile::check`]/[`InviteFile::verify_against`]）。
+/// Load an invite file (§1.3.3f `load_invite(path)`: disk read + v3
+/// version check + structural verification; expiry/external-root
+/// comparison are performed by the caller with context via
+/// [`InviteFile::check`]/[`InviteFile::verify_against`]).
 pub fn load_invite(path: &Path) -> Result<InviteFile, TrustError> {
     let bytes = std::fs::read(path)?;
     InviteFile::from_bytes(&bytes)
 }
 
 // ============================================================================
-// PinStore（cluster_id → 集群根公钥）
+// PinStore (cluster_id → cluster root public key)
 // ============================================================================
 
-/// 钉扎判定。Mismatch 载两把公钥（16+32+32B；判定枚举按值返回，尺寸可接受——
-/// 盒装反使最常用的 Match 路径付出堆分配）。
+/// Pin verdict. Mismatch carries both keys (16+32+32B; verdict enums are
+/// returned by value, an acceptable size — boxing would instead make the
+/// most common Match path pay a heap allocation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum PinVerdict {
-    /// 呈现根与钉扎一致。
+    /// Presented root matches the pin.
     Match,
-    /// 集群根公钥**变更**——显式告警路径：携带钉扎值与呈现值，根公钥变更 = 显式告警 +
-    /// 人工确认（§2.4 表）；确认后用 [`PinStore::pin`] 覆写。
+    /// Cluster root public key **changed** — explicit alert path:
+    /// carries the pinned value and the presented value; a root key
+    /// change = explicit alert + manual confirmation (§2.4 table); after
+    /// confirmation, overwrite via [`PinStore::pin`].
     Mismatch {
         pinned: VerifyingKey,
         presented: VerifyingKey,
     },
-    /// 该集群尚无钉扎（TOFU 首连路径：展示 [`Fingerprint`] 后 [`PinStore::pin`]）。
+    /// No pin for this cluster yet (TOFU first-connect path: display the
+    /// [`Fingerprint`], then [`PinStore::pin`]).
     NotPinned,
 }
 
-/// 钉扎存储（known_hosts 语义，集群根级；文件适配器首发）。
+/// Pin storage (known_hosts semantics, cluster-root level; the file
+/// adapter ships first).
 #[derive(Debug, Clone, Default)]
 pub struct PinStore {
     pins: BTreeMap<[u8; 16], VerifyingKey>,
-    /// 每集群已见最高 dir_version（dir_pull 回退检测）。
+    /// Highest dir_version seen per cluster (dir_pull rollback
+    /// detection).
     dir_versions: BTreeMap<[u8; 16], u64>,
 }
 
 impl PinStore {
-    /// 空存储。
+    /// Empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 首钉（TOFU 确认后）或覆写（根变更经人工确认后）。返回写入前的判定
-    /// （NotPinned = 首钉；Mismatch = 变更覆写——调用方必须已走告警流程）。
+    /// First pin (after TOFU confirmation) or overwrite (after a root
+    /// change passes manual confirmation). Returns the verdict from
+    /// before the write (NotPinned = first pin; Mismatch =
+    /// change-overwrite — the caller must have gone through the alert
+    /// flow).
     pub fn pin(&mut self, cluster_id: &ClusterId, root_pub: &VerifyingKey) -> PinVerdict {
         let prev = self.verify_pinned(cluster_id, root_pub);
         self.pins.insert(cluster_id.0, *root_pub);
         prev
     }
 
-    /// 比对钉扎（不写入）。**变更不可静默**：Mismatch 必须触发显式告警 UI（§3.8）。
+    /// Compare against the pin (no write). **A change must not be
+    /// silent**: Mismatch must trigger the explicit alert UI (§3.8).
     pub fn verify_pinned(&self, cluster_id: &ClusterId, root_pub: &VerifyingKey) -> PinVerdict {
         match self.pins.get(&cluster_id.0) {
             Some(pinned) if pinned == root_pub => PinVerdict::Match,
@@ -483,19 +556,21 @@ impl PinStore {
         }
     }
 
-    /// 取某集群的钉扎根公钥。
+    /// Get a cluster's pinned root public key.
     pub fn pinned_root(&self, cluster_id: &ClusterId) -> Option<&VerifyingKey> {
         self.pins.get(&cluster_id.0)
     }
 
-    /// 已见最高 dir_version。
+    /// Highest dir_version seen.
     pub fn seen_dir_version(&self, cluster_id: &ClusterId) -> Option<u64> {
         self.dir_versions.get(&cluster_id.0).copied()
     }
 
-    /// dir_pull 刷新落地（§3.8）：根验签 → 钉扎比对（变更 ⇒ [`TrustError::RootChanged`]
-    /// 显式告警路径）→ dir_version 回退拒收 → 记录版本。
-    /// 同版本重复分发（同内容幂等重放）放行。
+    /// dir_pull refresh landing (§3.8): root-signature verification →
+    /// pin comparison (change ⇒ [`TrustError::RootChanged`] explicit
+    /// alert path) → dir_version rollback rejection → record the
+    /// version. Same-version redistribution (an idempotent replay of
+    /// identical content) is allowed through.
     pub fn record_directory(
         &mut self,
         root_pub: &VerifyingKey,
@@ -513,7 +588,8 @@ impl PinStore {
                     presented: Box::new(presented),
                 })
             }
-            PinVerdict::NotPinned => { /* 首次见目录：由邀请/TOFU 路径先 pin */ }
+            PinVerdict::NotPinned => { /* first sight of the directory: the invite/TOFU path pins first */
+            }
         }
         if let Some(&stored) = self.dir_versions.get(&dir.cluster_id.0) {
             if dir.dir_version < stored {
@@ -527,7 +603,8 @@ impl PinStore {
         Ok(())
     }
 
-    /// 序列化（格式：`[ver=1][count u16]{ [16 cluster][32 root][8 dir_version] }`）。
+    /// Serialize (format: `[ver=1][count u16]{ [16 cluster][32 root][8
+    /// dir_version] }`).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = vec![1u8];
         v.extend_from_slice(&(self.pins.len() as u16).to_le_bytes());
@@ -546,7 +623,7 @@ impl PinStore {
         v
     }
 
-    /// 反序列化。
+    /// Deserialize.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, TrustError> {
         let mut rd = Rd::new(bytes);
         let ver = rd.u8()?;
@@ -572,21 +649,22 @@ impl PinStore {
         Ok(PinStore { pins, dir_versions })
     }
 
-    /// 落盘（unix 0600——钉扎文件按凭据对待；创建即 0600，无「先写后收紧」窗口，
-    /// 见 [`write_private_file`]）。
+    /// Persist (unix 0600 — pin files are treated as credentials;
+    /// created as 0600 directly, no "write first, tighten later" window,
+    /// see [`write_private_file`]).
     pub fn save(&self, path: &Path) -> Result<(), TrustStoreError> {
         write_private_file(path, &self.to_bytes())?;
         Ok(())
     }
 
-    /// 读盘。
+    /// Load from disk.
     pub fn load(path: &Path) -> Result<Self, TrustStoreError> {
         let bytes = std::fs::read(path)?;
         Ok(PinStore::from_bytes(&bytes)?)
     }
 }
 
-/// PinStore 落盘错误（IO 或编码）。
+/// PinStore persistence error (IO or encoding).
 #[derive(Debug)]
 pub struct TrustStoreError(TrustError);
 
@@ -608,13 +686,16 @@ impl From<TrustError> for TrustStoreError {
 }
 
 // ============================================================================
-// TOFU → 钉扎 的会话落地
+// Session-side landing of TOFU → pinning
 // ============================================================================
 
-/// TOFU 引导确认 + 钉扎落地（§1.3.3c/§1.3.3f 闭环）：
-/// 1. `verify_pinned`：NotPinned ⇒ `pin`（首钉，调用方已展示根指纹并确认）；
-///    Mismatch ⇒ [`TrustError::RootChanged`]（**告警路径，不静默**）。
-/// 2. 通过后执行 [`crate::session::TofuBootstrap::confirm`] 完成 I1/R1。
+/// TOFU bootstrap confirmation + pin landing (§1.3.3c/§1.3.3f closed
+/// loop):
+/// 1. `verify_pinned`: NotPinned ⇒ `pin` (first pin; the caller has
+///    already displayed the root fingerprint and confirmed); Mismatch ⇒
+///    [`TrustError::RootChanged`] (**alert path, not silent**).
+/// 2. On success, run [`crate::session::TofuBootstrap::confirm`] to
+///    finish I1/R1.
 pub async fn confirm_tofu_and_pin<S>(
     boot: crate::session::TofuBootstrap<S>,
     pins: &mut PinStore,
@@ -644,7 +725,7 @@ where
     Ok(tunnel)
 }
 
-/// TOFU 确认错误（信任层或握手层）。
+/// TOFU confirmation error (trust layer or handshake layer).
 #[derive(Debug)]
 pub struct TrustTofuError(TrustError);
 
@@ -656,7 +737,7 @@ impl std::fmt::Display for TrustTofuError {
 impl std::error::Error for TrustTofuError {}
 
 // ============================================================================
-// 单元测试
+// Unit tests
 // ============================================================================
 
 #[cfg(test)]
@@ -685,8 +766,11 @@ mod tests {
     fn directory_tamper_detected() {
         let (root, cid) = fixture();
         let mut dir = ClusterDirectory::issue(&root, cid, 3, vec![entry(1), entry(2)]);
-        assert!(dir.verify(&root.verifying_key()), "合法目录通过");
-        // to_bytes/from_bytes 往返（dir_pull 线格式，§3.11）
+        assert!(
+            dir.verify(&root.verifying_key()),
+            "a legitimate directory passes"
+        );
+        // to_bytes/from_bytes round trip (the dir_pull wire format, §3.11)
         let back = ClusterDirectory::from_bytes(&dir.to_bytes()).expect("dir roundtrip");
         assert_eq!(back.dir_version, dir.dir_version);
         assert!(back.verify(&root.verifying_key()));
@@ -694,19 +778,29 @@ mod tests {
         trailing.push(0);
         assert!(
             ClusterDirectory::from_bytes(&trailing).is_err(),
-            "尾随字节 ⇒ 拒"
+            "trailing bytes ⇒ rejected"
         );
-        // 条目被篡改（换 relay_endpoint）⇒ 验签失败
+        // An entry tampered (relay_endpoint swapped) ⇒ verification fails
         dir.servers[0].relay_endpoint = "evil.example:9".into();
-        assert!(!dir.verify(&root.verifying_key()), "条目被篡改 ⇒ 拒");
-        // 换根 ⇒ 验签失败
+        assert!(
+            !dir.verify(&root.verifying_key()),
+            "an entry tampered ⇒ rejected"
+        );
+        // Root swapped ⇒ verification fails
         let dir2 = ClusterDirectory::issue(&root, cid, 4, vec![entry(1)]);
         let other = SigningKey::from_bytes(&[9; 32]);
-        assert!(!dir2.verify(&other.verifying_key()), "另一根 ⇒ 拒");
-        // dir_version 被改 ⇒ 验签失败（版本在签名覆盖内）
+        assert!(
+            !dir2.verify(&other.verifying_key()),
+            "another root ⇒ rejected"
+        );
+        // dir_version altered ⇒ verification fails (the version is inside
+        // the signature coverage)
         let mut dir3 = ClusterDirectory::issue(&root, cid, 3, vec![entry(1)]);
         dir3.dir_version = 99;
-        assert!(!dir3.verify(&root.verifying_key()), "版本篡改 ⇒ 拒");
+        assert!(
+            !dir3.verify(&root.verifying_key()),
+            "version tampering ⇒ rejected"
+        );
     }
 
     #[test]
@@ -725,25 +819,25 @@ mod tests {
         assert_eq!(back.invite_id, [5; 16]);
         assert!(back.verify());
         assert!(back.verify_against(&root.verifying_key()));
-        // 根签名不匹配：篡改任意覆盖字段（invite_id）
+        // Root signature mismatch: tamper any covered field (invite_id)
         let mut tampered = bytes.clone();
-        let id_off = bytes.len() - 64 - 16; // invite_id 在 root_sig 前 16B
+        let id_off = bytes.len() - 64 - 16; // invite_id sits 16B before root_sig
         tampered[id_off] ^= 0x01;
         assert!(
             matches!(
                 InviteFile::from_bytes(&tampered).unwrap_err(),
                 TrustError::BadSignature
             ),
-            "根签名不匹配 ⇒ 拒载入"
+            "root signature mismatch ⇒ load rejected"
         );
-        // v2 拒收
+        // v2 rejected
         let mut v2 = bytes;
         v2[0] = 2;
         assert!(matches!(
             InviteFile::from_bytes(&v2).unwrap_err(),
             TrustError::UnsupportedInviteVersion(2)
         ));
-        // 过期
+        // Expired
         let expired = InviteFile::issue(&root, cid, 1, vec![], 100, [5; 16]);
         assert!(matches!(
             expired.check(200).unwrap_err(),
@@ -763,22 +857,23 @@ mod tests {
             pins.verify_pinned(&cid, &root.verifying_key()),
             PinVerdict::NotPinned
         );
-        // 首钉
+        // First pin
         let prev = pins.pin(&cid, &root.verifying_key());
         assert_eq!(prev, PinVerdict::NotPinned);
         assert_eq!(
             pins.verify_pinned(&cid, &root.verifying_key()),
             PinVerdict::Match
         );
-        // 变更告警路径（可测）：Mismatch 携带新旧两把公钥
+        // Change-alert path (testable): Mismatch carries both keys, old
+        // and new
         match pins.verify_pinned(&cid, &other.verifying_key()) {
             PinVerdict::Mismatch { pinned, presented } => {
                 assert_eq!(pinned, root.verifying_key());
                 assert_eq!(presented, other.verifying_key());
             }
-            v => panic!("期望 Mismatch，got {v:?}"),
+            v => panic!("expected Mismatch, got {v:?}"),
         }
-        // 序列化往返
+        // Serialization round trip
         let bytes = pins.to_bytes();
         let back = PinStore::from_bytes(&bytes).expect("roundtrip");
         assert_eq!(
@@ -787,8 +882,10 @@ mod tests {
         );
     }
 
-    // 落盘形态：save_invite / PinStore::save 往返 + unix 下 0600（创建即 0600，
-    // 无「fs::write 后补收紧」的权限窗口——本测试同时守「写后可读回」不回归）。
+    // Persistence shapes: save_invite / PinStore::save round trips + 0600
+    // on unix (created as 0600, no permission window from "fs::write
+    // then tighten later" — this test also guards "readable back after
+    // write" against regressions).
     #[test]
     fn invite_and_pinstore_save_roundtrip_and_mode() {
         let (root, cid) = fixture();
@@ -802,7 +899,7 @@ mod tests {
         assert_eq!(
             load_invite(&ipath).unwrap().invite_id,
             [6; 16],
-            "邀请落盘可读回"
+            "the persisted invite reads back"
         );
 
         let mut pins = PinStore::new();
@@ -814,7 +911,7 @@ mod tests {
                 .unwrap()
                 .verify_pinned(&cid, &root.verifying_key()),
             PinVerdict::Match,
-            "钉扎落盘可读回"
+            "the persisted pins read back"
         );
 
         #[cfg(unix)]
@@ -841,9 +938,9 @@ mod tests {
         pins.pin(&cid, &root.verifying_key());
         let v3 = ClusterDirectory::issue(&root, cid, 3, vec![entry(1)]);
         pins.record_directory(&root.verifying_key(), &v3)
-            .expect("v3 收");
+            .expect("v3 accepted");
         assert_eq!(pins.seen_dir_version(&cid), Some(3));
-        // 回退到 v2 ⇒ 拒
+        // Rollback to v2 ⇒ rejected
         let v2 = ClusterDirectory::issue(&root, cid, 2, vec![entry(1)]);
         assert!(
             matches!(
@@ -851,14 +948,14 @@ mod tests {
                     .unwrap_err(),
                 TrustError::DirVersionRollback { stored: 3, got: 2 }
             ),
-            "dir_version 回退 ⇒ 拒载入"
+            "dir_version rollback ⇒ load rejected"
         );
-        // v4 ⇒ 收
+        // v4 ⇒ accepted
         let v4 = ClusterDirectory::issue(&root, cid, 4, vec![entry(1), entry(2)]);
         pins.record_directory(&root.verifying_key(), &v4)
-            .expect("v4 收");
+            .expect("v4 accepted");
         assert_eq!(pins.seen_dir_version(&cid), Some(4));
-        // 换根签发 ⇒ 告警路径错误
+        // Issued under a swapped root ⇒ alert-path error
         let bad_root = SigningKey::from_bytes(&[9; 32]);
         let forged = ClusterDirectory::issue(&bad_root, cid, 5, vec![entry(1)]);
         assert!(
@@ -867,7 +964,7 @@ mod tests {
                     .unwrap_err(),
                 TrustError::RootChanged { .. }
             ),
-            "根变更 ⇒ 显式告警路径"
+            "root change ⇒ explicit alert path"
         );
     }
 }

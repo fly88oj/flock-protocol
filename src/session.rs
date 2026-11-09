@@ -1,53 +1,83 @@
-//! 隧道会话层（docs/design.md §1.3.3c / §3.5，P0-2、P1-8、P1-10 承载）。
+//! Tunnel session layer (docs/design.md §1.3.3c / §3.5, carrying P0-2,
+//! P1-8, P1-10).
 //!
-//! 深模块契约：调用方只见 [`Tunnel`]；握手、记录层、抗重放、rekey、keepalive、
-//! 伪造限额全部内建。
+//! Deep-module contract: callers see only [`Tunnel`]; handshake, record
+//! layer, anti-replay, rekey, keepalive, and the forgery limit are all
+//! built in.
 //!
-//! # 握手双形态（§1.3.3c / §3.8）
+//! # Dual handshake forms (§1.3.3c / §3.8)
 //!
-//! - **已钉扎形态（常态 1-RTT，Noise IK 结构）**：
-//!   `I1 = ver ‖ 算法集 ‖ 期望服务器身份公钥 ‖ X25519 临时 ‖ ML-KEM-768 ct(1088B，
-//!   封给目标服务器静态 ML-KEM 公钥) ‖ AEAD(HKDF(x25519(e,s_srv)‖mlkem_ss); 设备静态
-//!   X25519 公钥+设备 Ed25519 公钥+设备签名)`；`R1 = 服务器 X25519 临时 ‖ 服务器身份
-//!   对 transcript 的签名 ‖ 双向密钥确认 tag`。握手后首帧即可承数据。
-//! - **TOFU 首连形态（仅一次，2-RTT）**：`I0 = ver ‖ 算法集`（无服务器静态材料，明文）→
-//!   `R0 = 入群凭证链（ServerEntry 全量 + 集群根公钥 + 根签名）+ 服务器身份对 I0‖R0
-//!   的签名` → 客户端验证凭证链、展示根指纹、确认后按钉扎形态发 `I1`/`R1`。
-//!   TOFU 不防首登在线 MITM（残余风险，§1.3.3f/§2.5-3）——组织场景走邀请文件强路径。
+//! - **Pinned form (steady-state 1-RTT, Noise IK structure)**:
+//!   `I1 = ver ‖ algorithm set ‖ expected server identity public key ‖
+//!   X25519 ephemeral ‖ ML-KEM-768 ct (1088B, encapsulated to the target
+//!   server's static ML-KEM public key) ‖ AEAD(HKDF(x25519(e,s_srv) ‖
+//!   mlkem_ss); device static X25519 public key + device Ed25519 public
+//!   key + device signature)`; `R1 = server X25519 ephemeral ‖ server
+//!   identity's signature over the transcript ‖ two-way key confirmation
+//!   tag`. The first frame after the handshake can carry data.
+//! - **TOFU first-connect form (once only, 2-RTT)**: `I0 = ver ‖
+//!   algorithm set` (no server static material, plaintext) → `R0 = the
+//!   join credential chain (full ServerEntry + cluster root public key +
+//!   root signature) + the server identity's signature over I0‖R0` → the
+//!   client verifies the credential chain, displays the root fingerprint,
+//!   and after confirmation sends `I1`/`R1` in the pinned form. TOFU does
+//!   not defend against an online MITM at first login (residual risk,
+//!   §1.3.3f/§2.5-3) — organizational settings use the strong invite-file
+//!   path.
 //!
-//! # 签名覆盖契约（防 UKS，§1.3.3c / §3.5）
+//! # Signature coverage contract (anti-UKS, §1.3.3c / §3.5)
 //!
-//! 设备签名覆盖 I1 **全部已发字段** + 协议上下文（cluster_id、期望的服务器身份公钥、
-//! 用途标签）；服务器身份签名覆盖 I1‖R1 全 transcript。篡改上下文/换服务器身份 ⇒
-//! 验签必失败（M1 失败向量见 tests/session_mux.rs）。
+//! The device signature covers **all sent fields** of I1 plus the
+//! protocol context (cluster_id, expected server identity public key,
+//! purpose label); the server identity signature covers the full
+//! I1‖R1 transcript. Tampering with the context or swapping the server
+//! identity ⇒ verification necessarily fails (M1 failure vectors in
+//! tests/session_mux.rs).
 //!
-//! # 记录层（P0-2）
+//! # Record layer (P0-2)
 //!
-//! `[u32 LE len ≤1MiB][type][AEAD(payload)]`；nonce = 32-bit 零 ‖ 64-bit LE 计数器
-//! （WireGuard 形态；GCM/GCM-SIV 12B，XChaCha 档 24B = 16B 零 ‖ 计数器）；每方向独立
-//! 密钥与计数器。**计数器不上线**——TCP 有序 ⇒ 接收侧以「上一条 +1」重建隐式计数；
-//! 任何不匹配（含重放的字节重复、回退）表现为认证失败 ⇒ 拒绝并计入伪造。
-//! 长会话禁随机 96-bit nonce（两档分立，§1.3.3b/verdict §3.4）。
+//! `[u32 LE len ≤1MiB][type][AEAD(payload)]`; nonce = 32 bits of zeros ‖
+//! 64-bit LE counter (WireGuard shape; 12B for GCM/GCM-SIV, the XChaCha
+//! tier 24B = 16B zeros ‖ counter); independent keys and counters per
+//! direction. **The counter never goes on the wire** — TCP is ordered ⇒
+//! the receiving side rebuilds the implicit counter as "previous + 1";
+//! any mismatch (including byte-level replays and rollbacks) manifests
+//! as an authentication failure ⇒ rejected and counted as forgery.
+//! Random 96-bit nonces are forbidden for long sessions (the two
+//! profiles stay separate, §1.3.3b/verdict §3.4).
 //!
-//! # rekey（双阈值）
+//! # rekey (dual threshold)
 //!
-//! (2^60 包, 120s) 先到先触发，REKEY_INIT/RESP 走控制记录（新混合 KEM：
-//! INIT 携 1216B 临时混合公钥，RESP 携 1120B 混合密文），epoch 切换后计数器随新密钥
-//! 重置；旧接收密钥保留至新密钥首条记录到达（TCP 序下 in-flight 旧记录的宽限路径）；
-//! (2^64−2^13−1 包, 180s) 硬拒绝即清零密钥断链。时钟可注入（[`SessionClock`]）。
+//! (2^60 messages, 120s) — whichever comes first triggers;
+//! REKEY_INIT/RESP travel as control records (a fresh hybrid KEM: INIT
+//! carries a 1216B ephemeral hybrid public key, RESP carries a 1120B
+//! hybrid ciphertext); after the epoch switch the counters reset with
+//! the new keys; the old receive key is retained until the first record
+//! under the new key arrives (the grace path for in-flight old records
+//! under TCP ordering); at (2^64−2^13−1 messages, 180s) the hard reject
+//! zeroes keys and tears down. The clock is injectable
+//! ([`SessionClock`]).
 //!
-//! rekey 切换点（竞态修复注记，blocking 复核后定型）：INIT 处理（seal RESP + 切换）在
-//! **写泵**（唯一密封点：密封序=上线序=计数器序）；RESP 应用（切换）在**读泵同步执行**——
-//! 否则读泵会在 RESP 应用前抢先读入新纪元记录，旧钥解新钥被误判伪造并静默丢弃，且丢弃
-//! K 条后隐式计数器永久错位（单次命中即隧道死亡）。另设失步保险丝：连续
-//! [`AUTH_FAIL_STREAK`] 条认证失败 ⇒ 显式 Protocol 断链（fail-loud，不做静默丢数据的
-//! 半死状态）。
+//! rekey switch points (race-fix note, finalized after the blocking
+//! review): INIT handling (seal RESP + switch) happens in the **write
+//! pump** (the single sealing point: sealing order = wire order =
+//! counter order); RESP application (the switch) runs **synchronously in
+//! the read pump** — otherwise the read pump would read a new-epoch
+//! record before the RESP is applied, misjudge the old key opening the
+//! new key as forgery and silently drop it, and after K drops the
+//! implicit counter is permanently misaligned (a single hit kills the
+//! tunnel). Additionally a desync fuse: [`AUTH_FAIL_STREAK`]
+//! consecutive authentication failures ⇒ explicit Protocol teardown
+//! (fail-loud; no half-dead state that silently drops data).
 //!
-//! # 心跳（§1.3.3d「keepalive = yamux ping 10s」的实现注记，如实声明）
+//! # Heartbeats (implementation note for §1.3.3d "keepalive = yamux ping
+//! 10s", stated honestly)
 //!
-//! yamux 0.14.1 公开 API 不暴露 ping 发起（本次源码核实），10s 心跳由本层加密
-//! PING/PONG 记录承担（crypto-2026 §6.4 形态：保活帧本身也是加密帧），静默死链
-//! 判定 = 3×keepalive 无入站 ⇒ 断链（A9 语义）。
+//! yamux 0.14.1's public API exposes no ping initiation (verified
+//! against source this round); the 10s heartbeat is carried by encrypted
+//! PING/PONG records in this layer (crypto-2026 §6.4 shape: keepalive
+//! frames are themselves encrypted frames); silent dead-link verdict =
+//! 3×keepalive with no inbound ⇒ teardown (A9 semantics).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -70,49 +100,56 @@ use crate::kem::{self, bridge, Fingerprint, HybridKeypair, HybridPubkey};
 use crate::mux::{MuxIo, PacketChannel, Prio, Stream};
 
 // ============================================================================
-// 常量与帧类型
+// Constants and frame types
 // ============================================================================
 
-/// 会话协议版本（I0/I1 携带，不匹配即拒）。
+/// Session protocol version (carried by I0/I1; mismatch is rejected).
 pub const PROTOCOL_VERSION: u8 = 1;
 
-/// 单条记录/握手消息上限：`len ≤ 1MiB`（§1.3.3c）。
+/// Single record/handshake-message cap: `len ≤ 1MiB` (§1.3.3c).
 pub const MAX_FRAME: usize = 1024 * 1024;
 
-/// rekey 触发计数阈值默认值 2^60（WireGuard RekeyAfterMessages，crypto-2026 §6）。
+/// Default rekey counter threshold 2^60 (WireGuard RekeyAfterMessages,
+/// crypto-2026 §6).
 pub const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
-/// 硬拒绝计数阈值默认值 2^64 − 2^13 − 1（WireGuard RejectAfterMessages）。
+/// Default hard-reject counter threshold 2^64 − 2^13 − 1 (WireGuard
+/// RejectAfterMessages).
 pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - 8192;
 
-/// rekey 触发时间阈值默认 120s。
+/// Default rekey time threshold 120s.
 pub const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
-/// 硬拒绝时间阈值默认 180s。
+/// Default hard-reject time threshold 180s.
 pub const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
-/// keepalive 默认 10s（§1.3.3c / VPN-16）。
+/// Default keepalive 10s (§1.3.3c / VPN-16).
 pub const KEEPALIVE: Duration = Duration::from_secs(10);
-/// 伪造尝试限额默认 100（P0-2）。
+/// Default forgery-attempt limit 100 (P0-2).
 pub const FORGE_LIMIT: u32 = 100;
-/// REKEY_INIT 未获 RESP 的重试间隔（wireguard-go RekeyTimeout 节奏，crypto-2026 §6）。
+/// REKEY_INIT retry interval when no RESP arrives (wireguard-go
+/// RekeyTimeout cadence, crypto-2026 §6).
 const REKEY_RETRY: Duration = Duration::from_secs(5);
-/// 失步保险丝阈值：连续认证失败达此数（且无一条成功插入）判 Protocol 断链。
+/// Desync fuse threshold: this many consecutive authentication failures
+/// (without a single successful insert) verdicts a Protocol teardown.
 const AUTH_FAIL_STREAK: u64 = 16;
-/// 会话定时器节拍（真实时间；阈值判定用注入时钟）。
+/// Session timer tick (real time; threshold verdicts use the injected
+/// clock).
 const TIMER_TICK: Duration = Duration::from_millis(50);
 
-/// 握手消息类型字节（线上契约，interop/测试向量用）。
+/// Handshake message type bytes (wire contract, used by interop/test
+/// vectors).
 pub const RT_I0: u8 = 0x01;
 pub const RT_R0: u8 = 0x02;
 pub const RT_I1: u8 = 0x03;
 pub const RT_R1: u8 = 0x04;
-/// 控制记录（加密后走记录层）。
+/// Control records (encrypted onto the record layer).
 pub const RT_REKEY_INIT: u8 = 0x10;
 pub const RT_REKEY_RESP: u8 = 0x11;
-/// 数据记录（yamux 承载）与心跳。
+/// Data records (yamux carrier) and heartbeats.
 pub const RT_DATA: u8 = 0x20;
 pub const RT_PING: u8 = 0x21;
 pub const RT_PONG: u8 = 0x22;
 
-// 领域分离标签（HKDF info / 签名上下文 / transcript 上下文）。
+// Domain-separation labels (HKDF info / signature contexts / transcript
+// contexts).
 const L_I1_K1: &[u8] = b"flock-protocol/session/i1-k1/v1";
 const L_I1_ENC: &[u8] = b"flock-protocol/session/i1-enc/v1";
 const L_TRAFFIC: &[u8] = b"flock-protocol/session/traffic/v1";
@@ -126,25 +163,26 @@ const SIG_R0: &[u8] = b"flock-protocol/session/r0-server-sig/v1";
 const SIG_ENTRY: &[u8] = b"flock-protocol/trust/server-entry/v1";
 
 // ============================================================================
-// 错误
+// Errors
 // ============================================================================
 
-/// 会话终止原因（stats 可观测）。
+/// Session termination reason (observable via stats).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseReason {
-    /// 伪造尝试达 [`TunnelConfig::forge_limit`]（P0-2 断链纪律）。
+    /// Forgery attempts reached [`TunnelConfig::forge_limit`] (P0-2
+    /// teardown discipline).
     ForgeLimit,
-    /// rekey 双阈值之 (2^64−2^13−1, 180s) 硬拒绝。
+    /// Hard reject of the rekey dual threshold at (2^64−2^13−1, 180s).
     RejectAfter,
-    /// 3×keepalive 无入站（静默死链，A9）。
+    /// 3×keepalive with no inbound (silent dead link, A9).
     DeadLink,
-    /// 协议违约（帧超限/未知类型）。
+    /// Protocol violation (oversized frame/unknown type).
     Protocol,
-    /// 底层 IO 错误。
+    /// Underlying IO error.
     Io,
-    /// 对端关闭（EOF）。
+    /// Peer closed (EOF).
     PeerClosed,
-    /// 本端主动关闭（[`Tunnel::shutdown`] / Drop）。
+    /// Locally initiated close ([`Tunnel::shutdown`] / Drop).
     SessionClosed,
 }
 
@@ -163,24 +201,28 @@ impl fmt::Display for CloseReason {
     }
 }
 
-/// 会话层错误。
+/// Session-layer error.
 #[derive(Debug)]
 pub enum SessionError {
-    /// 底层 IO。
+    /// Underlying IO.
     Io(io::Error),
-    /// 握手验证失败（stage 标注：签名/解密/版本/身份等）。
+    /// Handshake verification failed (the stage label: signature/
+    /// decryption/version/identity etc.).
     Handshake(&'static str),
-    /// 设备被拒（NotFound/Revoked/公钥不匹配——**不区分**，防在线探测枚举，§1.3.3c）。
+    /// Device rejected (NotFound/Revoked/public-key mismatch —
+    /// **indistinguishable**, preventing online probing enumeration,
+    /// §1.3.3c).
     DeviceRejected,
-    /// AEAD 协商无交集（P1-8）。
+    /// No AEAD intersection in negotiation (P1-8).
     AeadMismatch,
-    /// 状态机收到非预期消息类型（字节为收到的 type）。
+    /// The state machine received an unexpected message type (the byte
+    /// is the received type).
     UnexpectedMessage(u8),
-    /// 协议违约。
+    /// Protocol violation.
     Protocol(&'static str),
-    /// 记录认证失败（已计入伪造）。
+    /// Record authentication failed (already counted as forgery).
     RecordAuth,
-    /// 会话已终止。
+    /// Session already terminated.
     Closed(CloseReason),
 }
 
@@ -212,16 +254,17 @@ impl From<io::Error> for SessionError {
 }
 
 // ============================================================================
-// 时钟注入
+// Clock injection
 // ============================================================================
 
-/// 会话单调时钟接缝：rekey/硬拒绝/keepalive 的阈值判定全部走它（测试注入 [`ManualClock`]）。
+/// Session monotonic-clock seam: all rekey/hard-reject/keepalive
+/// threshold verdicts go through it (tests inject [`ManualClock`]).
 pub trait SessionClock: Send + Sync + 'static {
-    /// 当前单调时刻。
+    /// Current monotonic instant.
     fn now(&self) -> tokio::time::Instant;
 }
 
-/// 系统时钟（默认）。
+/// The system clock (default).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
@@ -231,20 +274,21 @@ impl SessionClock for SystemClock {
     }
 }
 
-/// 可手动拨动的时钟（测试/基准注入用）。
+/// A manually adjustable clock (for test/benchmark injection).
 pub struct ManualClock {
     now: StdMutex<tokio::time::Instant>,
 }
 
 impl ManualClock {
-    /// 以当前真实时刻起。
+    /// Starts at the current real instant.
     pub fn new() -> Self {
         ManualClock {
             now: StdMutex::new(tokio::time::Instant::now()),
         }
     }
 
-    /// 前拨 `d`（rekey/硬拒绝阈值判定即刻可见）。
+    /// Advance forward by `d` (rekey/hard-reject threshold verdicts see
+    /// it immediately).
     pub fn advance(&self, d: Duration) {
         let mut g = self.now.lock().expect("ManualClock poisoned");
         let cur: std::time::Instant = (*g).into_std();
@@ -265,22 +309,25 @@ impl SessionClock for ManualClock {
 }
 
 // ============================================================================
-// AEAD 档位与协商（P1-8）
+// AEAD tiers and negotiation (P1-8)
 // ============================================================================
 
-/// 记录层 AEAD 算法（主 AES-256-GCM；后备 XChaCha20-Poly1305 / AES-256-GCM-SIV）。
+/// Record-layer AEAD algorithm (primary AES-256-GCM; fallbacks
+/// XChaCha20-Poly1305 / AES-256-GCM-SIV).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AeadChoice {
-    /// 主档：AES-256-GCM（aes-gcm 0.11.1，有 AES-NI 硬件时最快，verdict §0）。
+    /// Primary tier: AES-256-GCM (aes-gcm 0.11.1; fastest with AES-NI
+    /// hardware, verdict §0).
     Aes256Gcm,
-    /// 后备：XChaCha20-Poly1305（无 AES 硬件端）。
+    /// Fallback: XChaCha20-Poly1305 (for ends without AES hardware).
     XChaCha20Poly1305,
-    /// 后备：AES-256-GCM-SIV（抗误用/复制敏感场景）。
+    /// Fallback: AES-256-GCM-SIV (misuse-resistant / duplication-sensitive
+    /// settings).
     Aes256GcmSiv,
 }
 
 impl AeadChoice {
-    /// 线上代码字节。
+    /// Wire code byte.
     pub fn code(self) -> u8 {
         match self {
             AeadChoice::Aes256Gcm => 1,
@@ -299,10 +346,12 @@ impl AeadChoice {
     }
 }
 
-/// 有序偏好列表；协商 = 服务器按自身顺序取第一个也出现在客户端列表中的档位（交集）。
+/// Ordered preference list; negotiation = the server takes, in its own
+/// order, the first tier that also appears in the client's list (the
+/// intersection).
 #[derive(Debug, Clone)]
 pub struct AeadPreference {
-    /// 有序偏好（至少一项，去重）。
+    /// Ordered preferences (at least one entry, deduplicated).
     pub order: Vec<AeadChoice>,
 }
 
@@ -319,12 +368,12 @@ impl Default for AeadPreference {
 }
 
 impl AeadPreference {
-    /// 单档偏好（测试/钉死部署用）。
+    /// Single-tier preference (for tests/pinned deployments).
     pub fn only(c: AeadChoice) -> Self {
         AeadPreference { order: vec![c] }
     }
 
-    /// 编码为线上 `[n][codes]`。
+    /// Encode as the wire form `[n][codes]`.
     fn encode(&self) -> Vec<u8> {
         let mut v = vec![self.order.len() as u8];
         v.extend(self.order.iter().map(|c| c.code()));
@@ -332,7 +381,8 @@ impl AeadPreference {
     }
 }
 
-/// 协商：服务器偏好序 × 客户端列表 → 第一个交集项。
+/// Negotiation: server preference order × client list → the first
+/// intersection entry.
 fn negotiate(server: &AeadPreference, client: &[AeadChoice]) -> Option<AeadChoice> {
     server.order.iter().copied().find(|c| client.contains(c))
 }
@@ -353,22 +403,23 @@ fn parse_aead_list(b: &[u8]) -> Result<Vec<AeadChoice>, SessionError> {
     Ok(out)
 }
 
-// —— 统一记录密码（计数器 nonce 构造内部化）——
+// —— Unified record cipher (counter-nonce construction internalized) ——
 
-/// 记录密码接缝：seal/open 以隐式计数器构造 nonce。
+/// Record-cipher seam: seal/open build the nonce from the implicit
+/// counter.
 trait RecordCipher: Send {
     fn seal(&self, counter: u64, aad: &[u8], pt: &[u8]) -> Vec<u8>;
     fn open(&self, counter: u64, aad: &[u8], ct: &[u8]) -> Option<Vec<u8>>;
 }
 
-/// 12B nonce = 4B 零 ‖ 8B LE 计数器（WireGuard 形态，§1.3.3c）。
+/// 12B nonce = 4B zeros ‖ 8B LE counter (WireGuard shape, §1.3.3c).
 fn nonce12(counter: u64) -> [u8; 12] {
     let mut n = [0u8; 12];
     n[4..].copy_from_slice(&counter.to_le_bytes());
     n
 }
 
-/// XChaCha 档 24B nonce = 16B 零 ‖ 8B LE 计数器。
+/// XChaCha-tier 24B nonce = 16B zeros ‖ 8B LE counter.
 fn nonce24(counter: u64) -> [u8; 24] {
     let mut n = [0u8; 24];
     n[16..].copy_from_slice(&counter.to_le_bytes());
@@ -521,22 +572,24 @@ fn make_cipher(choice: AeadChoice, key: &[u8; 32]) -> Box<dyn RecordCipher + Sen
 }
 
 // ============================================================================
-// 配置
+// Configuration
 // ============================================================================
 
-/// 隧道配置（§1.3.3c）。
+/// Tunnel configuration (§1.3.3c).
 pub struct TunnelConfig {
-    /// AEAD 档位与偏好序（协商取交集，P1-8）。
+    /// AEAD tiers and preference order (negotiation takes the
+    /// intersection, P1-8).
     pub aead: AeadPreference,
-    /// keepalive 周期（默认 10s；静默死链判定 = 3×keepalive）。
+    /// keepalive period (default 10s; silent dead-link verdict =
+    /// 3×keepalive).
     pub keepalive: Duration,
-    /// rekey 双阈值（默认 (2^60, 120s)）。
+    /// rekey dual threshold (default (2^60, 120s)).
     pub rekey_after: (u64, Duration),
-    /// 硬拒绝双阈值（默认 (2^64−2^13−1, 180s)）。
+    /// hard-reject dual threshold (default (2^64−2^13−1, 180s)).
     pub reject_after: (u64, Duration),
-    /// 伪造尝试限额（默认 100，达限断链）。
+    /// forgery-attempt limit (default 100; reaching it tears down).
     pub forge_limit: u32,
-    /// 时钟（默认系统时钟；测试注入 [`ManualClock`]）。
+    /// Clock (default system clock; tests inject [`ManualClock`]).
     pub clock: Arc<dyn SessionClock>,
 }
 
@@ -578,50 +631,53 @@ impl fmt::Debug for TunnelConfig {
     }
 }
 
-/// 会话统计（§1.3.3c `stats()`）。
+/// Session statistics (§1.3.3c `stats()`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionStats {
-    /// 当前密钥纪元（握手 = 0，每完成一次 rekey +1）。
+    /// Current key epoch (handshake = 0; +1 per completed rekey).
     pub epoch: u64,
-    /// 已完成的 rekey 次数。
+    /// Completed rekey count.
     pub rekeys: u64,
-    /// 已发送记录数（含控制/心跳）。
+    /// Records sent (including control/heartbeat).
     pub sent_records: u64,
-    /// 已接收记录数（含控制/心跳）。
+    /// Records received (including control/heartbeat).
     pub received_records: u64,
-    /// 伪造尝试累计（含重放，达 [`TunnelConfig::forge_limit`] 断链）。
+    /// Cumulative forgery attempts (including replays; reaching
+    /// [`TunnelConfig::forge_limit`] tears down).
     pub forge_attempts: u64,
-    /// 其中判定为字节级重复（重放）的次数。
+    /// Of those, the count verdicted as byte-level duplicates (replays).
     pub replay_rejected: u64,
-    /// 协商出的 AEAD 档。
+    /// The negotiated AEAD tier.
     pub aead: AeadChoice,
-    /// 终止原因（存活 = None）。
+    /// Termination reason (alive = None).
     pub closed: Option<CloseReason>,
 }
 
 // ============================================================================
-// 身份与设备目录（§1.3.3c lookup 接缝）
+// Identities and the device directory (§1.3.3c lookup seam)
 // ============================================================================
 
-/// 集群标识（邀请文件/目录/握手上下文绑定）。
+/// Cluster identifier (bound into invite files/directories/handshake
+/// contexts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClusterId(pub [u8; 16]);
 
-/// 服务器标识。
+/// Server identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ServerId(pub [u8; 16]);
 
-/// 设备标识 = 设备 Ed25519 公钥指纹（SHA-256，§2.2）。
+/// Device identifier = fingerprint of the device's Ed25519 public key
+/// (SHA-256, §2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeviceId(pub [u8; 32]);
 
 impl DeviceId {
-    /// 由设备 Ed25519 公钥派生。
+    /// Derived from the device's Ed25519 public key.
     pub fn from_ed25519(vk: &VerifyingKey) -> Self {
         DeviceId(Sha256::digest(vk.as_bytes()).into())
     }
 
-    /// 原始 32B。
+    /// Raw 32B.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -636,39 +692,47 @@ impl fmt::Display for DeviceId {
     }
 }
 
-/// 注册表内的设备记录（静态公钥集，§2.2）。
+/// A device record in the registry (static public keys, §2.2).
 #[derive(Debug, Clone)]
 pub struct DeviceRecord {
-    /// 设备静态 X25519 公钥（会话索引/漫游，§2.4）。
+    /// Device static X25519 public key (session indexing/roaming, §2.4).
     pub device_x25519: XPub,
-    /// 设备 Ed25519 公钥（身份）。
+    /// Device Ed25519 public key (identity).
     pub device_ed25519: VerifyingKey,
 }
 
-/// 目录查询三态判定（§1.3.3c）。
+/// Directory lookup three-state verdict (§1.3.3c).
 #[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)] // Active 携带 64B 设备记录，远低于栈压阈值；盒化反增目录实现负担
+#[allow(clippy::large_enum_variant)] // Active carries a 64B device record, far below stack-pressure thresholds; boxing would add directory-side burden
 pub enum LookupVerdict {
-    /// 未注册。
+    /// Not registered.
     NotFound,
-    /// 已吊销（since_epoch = 吊销纪元，随 Raft apply 推进）。
+    /// Revoked (since_epoch = revocation epoch, advancing with Raft
+    /// apply).
     Revoked { since_epoch: u64 },
-    /// 在册有效。
+    /// Registered and active.
     Active(DeviceRecord),
 }
 
-/// 设备目录接缝：服务端把注册表/吊销查询注入协议库（多主多活的权限点之一）。
+/// Device-directory seam: the server injects registry/revocation lookups
+/// into the protocol library (one of the permission points of the
+/// multi-primary deployment).
 ///
-/// 必须异步（`BoxFuture`）：线性一致读经 Raft leader 是网络往返（§4）；
-/// `NotFound` 与 `Revoked` 都必须拒握手且**时序对齐**（防在线探测设备枚举）——
-/// 本实现的保证：两种判定在完成同一批握手密码学工作（解密 I1、验设备签名）之后，
-/// 返回**同一个**不透明错误 [`SessionError::DeviceRejected`]。
+/// Must be async (`BoxFuture`): linearizable reads through the Raft
+/// leader are a network round trip (§4); `NotFound` and `Revoked` must
+/// both reject the handshake **with aligned timing** (preventing online
+/// probing of device enumeration) — this implementation's guarantee:
+/// both verdicts, after completing the same batch of handshake
+/// cryptographic work (decrypting I1, verifying the device signature),
+/// return **the same** opaque error
+/// [`SessionError::DeviceRejected`].
 pub trait DeviceDirectory: Send + Sync + 'static {
-    /// 查询设备。
+    /// Look up a device.
     fn lookup(&self, id: &DeviceId) -> BoxFuture<'static, LookupVerdict>;
 }
 
-/// 闭包式目录实现（`Fn(&DeviceId) -> BoxFuture<...>` 直接可用）。
+/// Closure-style directory implementation (`Fn(&DeviceId) ->
+/// BoxFuture<...>` works directly).
 impl<F> DeviceDirectory for F
 where
     F: Fn(&DeviceId) -> BoxFuture<'static, LookupVerdict> + Send + Sync + 'static,
@@ -678,7 +742,8 @@ where
     }
 }
 
-/// 内存目录（测试/单服形态起步用）。
+/// In-memory directory (for tests / the single-server form to start
+/// with).
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryDirectory {
     devices: HashMap<[u8; 32], DeviceRecord>,
@@ -686,19 +751,19 @@ pub struct InMemoryDirectory {
 }
 
 impl InMemoryDirectory {
-    /// 空目录。
+    /// Empty directory.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 注册/更新设备。
+    /// Register/update a device.
     pub fn register(&mut self, rec: DeviceRecord) {
         let id: [u8; 32] = Sha256::digest(rec.device_ed25519.as_bytes()).into();
         self.revoked.remove(&id);
         self.devices.insert(id, rec);
     }
 
-    /// 吊销设备。
+    /// Revoke a device.
     pub fn revoke(&mut self, id: &DeviceId, since_epoch: u64) {
         self.devices.remove(id.as_bytes());
         self.revoked.insert(*id.as_bytes(), since_epoch);
@@ -721,17 +786,18 @@ impl DeviceDirectory for InMemoryDirectory {
 }
 
 // ============================================================================
-// 设备 / 服务器身份材料
+// Device / server identity material
 // ============================================================================
 
-/// 设备静态密钥（X25519 会话用 + Ed25519 身份用；客户端生成永不出机，§2.4）。
+/// Device static keys (X25519 for sessions + Ed25519 for identity;
+/// client-generated, never leaves the machine, §2.4).
 pub struct DeviceStaticKeys {
     x25519: StaticSecret,
     ed25519: SigningKey,
 }
 
 impl DeviceStaticKeys {
-    /// 随机生成。
+    /// Generate randomly.
     pub fn generate() -> Self {
         let mut rng = rand::rng();
         DeviceStaticKeys {
@@ -740,22 +806,23 @@ impl DeviceStaticKeys {
         }
     }
 
-    /// 设备静态 X25519 公钥（32B）。
+    /// Device static X25519 public key (32B).
     pub fn x25519_public(&self) -> XPub {
         XPub::from(&self.x25519)
     }
 
-    /// 设备 Ed25519 公钥。
+    /// Device Ed25519 public key.
     pub fn ed25519_public(&self) -> VerifyingKey {
         self.ed25519.verifying_key()
     }
 
-    /// 内部签名钥引用（仅握手签名用）。
+    /// Internal signing-key reference (handshake signing only).
     fn signing(&self) -> &SigningKey {
         &self.ed25519
     }
 
-    /// 序列化：32B X25519 私钥 ‖ 32B Ed25519 seed（密钥材料，落盘 0600 由调用方负责）。
+    /// Serialization: 32B X25519 secret key ‖ 32B Ed25519 seed (key
+    /// material; 0600 persistence is the caller's responsibility).
     pub fn to_bytes(&self) -> [u8; 64] {
         let mut out = [0u8; 64];
         out[..32].copy_from_slice(&self.x25519.to_bytes());
@@ -763,7 +830,7 @@ impl DeviceStaticKeys {
         out
     }
 
-    /// 由 [] 恢复。
+    /// Restore from [].
     pub fn from_bytes(bytes: &[u8; 64]) -> Self {
         let x: [u8; 32] = bytes[..32].try_into().expect("32B");
         let seed: [u8; 32] = bytes[32..].try_into().expect("32B");
@@ -785,21 +852,25 @@ impl fmt::Debug for DeviceStaticKeys {
     }
 }
 
-/// 服务器接入材料（= §4 入群凭证的公开部分；根签名覆盖，§1.3.3f/§3.8）。
+/// Server access material (= the public part of the §4 join credential;
+/// covered by the root signature, §1.3.3f/§3.8).
 #[derive(Debug, Clone)]
 pub struct ServerEntry {
-    /// 服务器标识。
+    /// Server identifier.
     pub server_id: ServerId,
-    /// 对应中转用户口（frps host:port）。
+    /// The corresponding relay user port (frps host:port).
     pub relay_endpoint: String,
-    /// 服务器身份 Ed25519 公钥（R1 签名验证锚）。
+    /// Server identity Ed25519 public key (the R1 signature verification
+    /// anchor).
     pub identity_pub: VerifyingKey,
-    /// 服务器静态混合公钥（1216B；I1 的 ML-KEM ct 封装给它）。
+    /// Server static hybrid public key (1216B; I1's ML-KEM ct is
+    /// encapsulated to it).
     pub static_hybrid_pub: HybridPubkey,
 }
 
 impl ServerEntry {
-    /// 根签名覆盖的规范化字节（`SIG_ENTRY ‖ cluster_id ‖ server_id ‖ endpoint ‖ identity ‖ hybrid`）。
+    /// Canonical bytes covered by the root signature (`SIG_ENTRY ‖
+    /// cluster_id ‖ server_id ‖ endpoint ‖ identity ‖ hybrid`).
     pub fn canonical_bytes(&self, cluster_id: &ClusterId) -> Vec<u8> {
         let mut v = Vec::with_capacity(SIG_ENTRY.len() + 1300);
         v.extend_from_slice(SIG_ENTRY);
@@ -813,7 +884,8 @@ impl ServerEntry {
     }
 }
 
-/// 集群根密钥对 ServerEntry 的签名（入群凭证；`trust` 模块复用同一规范字节）。
+/// The cluster root key's signature over a ServerEntry (the join
+/// credential; the `trust` module reuses the same canonical bytes).
 pub fn sign_server_entry(
     root: &SigningKey,
     cluster_id: &ClusterId,
@@ -822,7 +894,7 @@ pub fn sign_server_entry(
     root.sign(&entry.canonical_bytes(cluster_id))
 }
 
-/// 验证入群凭证签名。
+/// Verify a join-credential signature.
 pub fn verify_server_entry(
     root_pub: &VerifyingKey,
     cluster_id: &ClusterId,
@@ -834,42 +906,50 @@ pub fn verify_server_entry(
         .is_ok()
 }
 
-/// Ed25519 公钥指纹（SHA-256；展示格式同 [`Fingerprint`]）。
+/// Ed25519 public-key fingerprint (SHA-256; display format same as
+/// [`Fingerprint`]).
 pub fn fingerprint_ed25519(vk: &VerifyingKey) -> Fingerprint {
     Fingerprint::from_digest(Sha256::digest(vk.as_bytes()).into())
 }
 
-/// 客户端持有的钉扎材料：集群根公钥 + 目标端点的 ServerEntry（§1.3.3c `ServerPin`）。
+/// Pinning material held by the client: cluster root public key + the
+/// target endpoint's ServerEntry (§1.3.3c `ServerPin`).
 #[derive(Debug, Clone)]
 pub struct ServerPin {
-    /// 期望集群。
+    /// Expected cluster.
     pub cluster_id: ClusterId,
-    /// 集群根公钥（TOFU/邀请建立；R0 验签锚）。
+    /// Cluster root public key (established via TOFU/invite; the R0
+    /// verification anchor).
     pub cluster_root_pub: VerifyingKey,
-    /// 目标端点接入材料。
+    /// Target endpoint access material.
     pub entry: ServerEntry,
 }
 
-/// 服务器身份材料（respond 侧）。
+/// Server identity material (respond side).
 pub struct ServerIdentity {
-    /// 所属集群。
+    /// Owning cluster.
     pub cluster_id: ClusterId,
-    /// 本机服务器标识。
+    /// This server's identifier.
     pub server_id: ServerId,
-    /// 身份签名钥（R0/R1 transcript 签名，P0-5 隧道侧）。
+    /// Identity signing key (R0/R1 transcript signatures, P0-5 tunnel
+    /// side).
     pub identity: SigningKey,
-    /// 静态混合密钥（I1 的 KEM 封装目标）。
+    /// Static hybrid key (the KEM encapsulation target of I1).
     pub static_hybrid: HybridKeypair,
-    /// 对应 ServerEntry（与 identity/static_hybrid 一致；R0 出示）。
+    /// The corresponding ServerEntry (consistent with
+    /// identity/static_hybrid; presented in R0).
     pub entry: ServerEntry,
-    /// 集群根公钥（TOFU R0 出示；客户端钉扎的本体）。
+    /// Cluster root public key (presented in the TOFU R0; what the client
+    /// pins).
     pub root_pub: VerifyingKey,
-    /// 根对本 ServerEntry 的签名（入群凭证，R0 出示）。
+    /// The root's signature over this ServerEntry (the join credential,
+    /// presented in R0).
     pub entry_sig: Signature,
 }
 
 impl ServerIdentity {
-    /// 由根密钥签发（测试/运维装配路径：根密钥离线保管，§4）。
+    /// Enrolled by the root key (test/ops assembly path: the root key is
+    /// kept offline, §4).
     pub fn enroll(
         root: &SigningKey,
         cluster_id: ClusterId,
@@ -908,7 +988,7 @@ impl fmt::Debug for ServerIdentity {
 }
 
 // ============================================================================
-// 帧与编解码小件
+// Frames and small codec pieces
 // ============================================================================
 
 fn frame_header(body_len: usize) -> [u8; 4] {
@@ -948,8 +1028,10 @@ async fn recv_frame<S: AsyncRead + Unpin>(io: &mut S) -> Result<(u8, Vec<u8>), S
     Ok((hdr[4], body))
 }
 
-/// 解析游标。
-/// 解码越界/长度错误（Rd 游标共用错误；session/trust 各自 From 转换，调用点 `?` 直通）。
+/// Parse cursor.
+/// Decode out-of-bounds/length errors (shared error of the Rd cursor;
+/// session/trust each provide a From conversion so call sites pass
+/// through with `?`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RdErr(pub &'static str);
 
@@ -959,7 +1041,8 @@ impl From<RdErr> for SessionError {
     }
 }
 
-/// 解析游标（session/trust 共用；ponytail：消除 trust 侧逐一同构的复刻）。
+/// Parse cursor (shared by session/trust; ponytail: removes trust's
+/// field-for-field duplicate).
 pub(crate) struct Rd<'a> {
     b: &'a [u8],
     pos: usize,
@@ -1011,8 +1094,10 @@ fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], okm: &mut [u8]) {
         .expect("HKDF-SHA256 output length valid");
 }
 
-/// 握手 k1 合流（ikm = x25519_ss ‖ ml_kem_ss，`Zeroizing` 包裹 Drop 清零；
-/// 返回值 k1 同为 Zeroizing——调用方即握手 k1/k_enc 的秘密材料纪律，§1.3.3c）。
+/// Handshake k1 confluence (ikm = x25519_ss ‖ ml_kem_ss, wrapped in
+/// `Zeroizing` for Drop zeroization; the return value k1 is likewise
+/// Zeroizing — this is the k1/k_enc secret-material discipline of the
+/// handshake, §1.3.3c).
 fn k1_from_shares(x_ss: &[u8], ml_ss: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut ikm = Zeroizing::new(Vec::with_capacity(x_ss.len() + ml_ss.len()));
     ikm.extend_from_slice(x_ss);
@@ -1022,15 +1107,19 @@ fn k1_from_shares(x_ss: &[u8], ml_ss: &[u8]) -> Zeroizing<[u8; 32]> {
     k1
 }
 
-/// 握手最终密钥组（§1.3.3c 记录层初始密钥）。
+/// Final handshake key group (§1.3.3c initial record-layer keys).
 ///
-/// 全字段为密钥材料：`ZeroizeOnDrop`——结构体 Drop 时全部清零（§1.3.3c 清零承诺；
-/// 派生进 Core 的方向密钥由 [`DirKeys`] 的清零纪律接管）。
+/// Every field is key material: `ZeroizeOnDrop` — the whole struct is
+/// zeroed on Drop (§1.3.3c zeroization commitment; the directional keys
+/// derived into Core are governed by [`DirKeys`]' zeroization
+/// discipline).
 #[derive(zeroize::ZeroizeOnDrop)]
 struct TrafficKeys {
     c2s: [u8; 32],
     s2c: [u8; 32],
-    /// R1 内的服务器→客户端密钥确认（客户端→服务器确认 = 握手后首条加密记录，隐式）。
+    /// The in-R1 server→client key confirmation (client→server
+    /// confirmation = the first encrypted record after the handshake,
+    /// implicit).
     confirm_s: [u8; 32],
     rekey_seed: [u8; 32],
 }
@@ -1062,10 +1151,12 @@ fn transcript_hash(i1_bytes: &[u8], chosen: AeadChoice, eph_srv: &[u8; 32]) -> [
 }
 
 // ============================================================================
-// 握手消息
+// Handshake messages
 // ============================================================================
 
-/// I1 已发字段（签名/密钥确认覆盖范围，防 UKS：含两个临时份额与算法集，§1.3.3c）。
+/// I1 sent fields (the coverage of the signature/key confirmation;
+/// anti-UKS: includes both ephemeral shares and the algorithm set,
+/// §1.3.3c).
 struct I1Msg {
     ver: u8,
     aead_list: Vec<u8>,
@@ -1073,10 +1164,10 @@ struct I1Msg {
     e_pub: [u8; 32],
     ml_ct: [u8; kem::ML_KEM_CT_LEN],
     nonce: [u8; 12],
-    enc: Vec<u8>, // ct||tag，pt = dev_x(32)‖dev_ed(32)‖dev_sig(64)
+    enc: Vec<u8>, // ct||tag, pt = dev_x(32)‖dev_ed(32)‖dev_sig(64)
 }
 
-/// I1 构造入参（收拢避免长参数表）。
+/// I1 construction inputs (gathered to avoid a long parameter list).
 struct I1Parts<'a> {
     e_pub: &'a [u8; 32],
     ml_ct: &'a Ciphertext<MlKem768>,
@@ -1108,7 +1199,8 @@ fn build_i1(p: I1Parts<'_>, rng: &mut impl rand::TryRngCore) -> Vec<u8> {
 
     let mut nonce = [0u8; 12];
     rng.try_fill_bytes(&mut nonce).expect("entropy");
-    // AAD = I1 全部已发字段（ver‖算法集‖期望身份‖e_pub‖ml_ct）
+    // AAD = all sent fields of I1 (ver‖algorithm set‖expected
+    // identity‖e_pub‖ml_ct)
     let mut aad = Vec::with_capacity(2 + aead_list.len() + 32 + 32 + kem::ML_KEM_CT_LEN);
     aad.push(PROTOCOL_VERSION);
     aad.extend_from_slice(aead_list);
@@ -1146,7 +1238,8 @@ fn parse_i1(b: &[u8]) -> Result<I1Msg, SessionError> {
     if ver != PROTOCOL_VERSION {
         return Err(SessionError::Handshake("protocol version"));
     }
-    // aead_list 保留「count 字节 + codes」完整形态（与 encode()/签名上下文一致）
+    // aead_list keeps the full "count byte + codes" shape (consistent
+    // with encode()/the signature context)
     let list_len = r.u8()? as usize;
     if list_len == 0 || list_len > 3 {
         return Err(SessionError::Handshake("empty/oversized aead list"));
@@ -1173,7 +1266,8 @@ fn parse_i1(b: &[u8]) -> Result<I1Msg, SessionError> {
     })
 }
 
-/// I1 签名覆盖字段（§1.3.3c：全部已发字段——含两个临时份额与算法集）。
+/// Fields covered by the I1 signature (§1.3.3c: all sent fields —
+/// including both ephemeral shares and the algorithm set).
 struct I1SignedFields<'a> {
     ver: u8,
     aead_list: &'a [u8],
@@ -1251,7 +1345,7 @@ fn i1_sig_context(
 }
 
 // ============================================================================
-// 记录层核心状态机
+// Record-layer core state machine
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1260,11 +1354,14 @@ enum Role {
     Server,
 }
 
-/// 方向密钥组（记录密码 + 计数器 + 密钥原材料）。
+/// Directional key group (record cipher + counter + key raw material).
 ///
-/// 清零纪律（§1.3.3c）：`key` 保留 32B 原材料副本以随本结构体生命期确定性清零
-/// （`Drop` 显式抹零；cipher 内的扩展密钥表属上游 crate 内部无法触达——原材料
-/// 不残留是本层可达的清零面）。rekey 轮换被替换的旧 [`DirKeys`] 随之清零。
+/// Zeroization discipline (§1.3.3c): `key` keeps a 32B copy of the raw
+/// material so it is deterministically zeroed with this struct's
+/// lifetime (explicit wipe on `Drop`; the expanded key schedule inside
+/// the cipher is upstream-crate-internal and unreachable — raw material
+/// leaving no residue is the zeroization surface this layer can reach).
+/// Old [`DirKeys`] replaced by a rekey rotation are zeroed with it.
 struct DirKeys {
     cipher: Box<dyn RecordCipher + Send>,
     counter: u64,
@@ -1290,15 +1387,18 @@ struct Inner {
     aead: AeadChoice,
     send: DirKeys,
     recv: DirKeys,
-    /// 旧接收密钥（rekey 后在途记录的宽限路径；新密钥首条记录到达即弃）。
+    /// Old receive key (the grace path for in-flight records after a
+    /// rekey; dropped as soon as the first new-key record arrives).
     retained_recv: Option<DirKeys>,
     rekey_seed: [u8; 32],
     pending: Option<PendingRekey>,
     forge_attempts: u64,
     replay_rejected: u64,
-    /// 连续认证失败计数（成功即清零）：失步保险丝——仅在 rekey 窗口内武装（见
-    /// open_record），连续 ≥AUTH_FAIL_STREAK 条且无一条成功 ⇒ 密钥失步/实现错误，
-    /// 显式断链（fail-loud）优于静默丢数据或半死隧道。
+    /// Consecutive-authentication-failure counter (reset on success): the
+    /// desync fuse — armed only inside rekey windows (see open_record);
+    /// AUTH_FAIL_STREAK consecutive failures without a single success ⇒
+    /// key desync/implementation error; explicit teardown (fail-loud)
+    /// beats silently dropping data or a half-dead tunnel.
     auth_fail_streak: u64,
     received: u64,
     rekeys: u64,
@@ -1311,29 +1411,33 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // 会话核心拆解：rekey_seed 显式清零（§1.3.3c）；方向密钥原材料随
-        // send/recv/retained_recv 的 DirKeys::Drop 清零。
+        // Session-core teardown: rekey_seed explicitly zeroized (§1.3.3c);
+        // directional key raw material zeroized via DirKeys::Drop of
+        // send/recv/retained_recv.
         self.rekey_seed.zeroize();
     }
 }
 
-/// 硬拒绝（[`CloseReason::RejectAfter`]）/伪造断链（[`CloseReason::ForgeLimit`]）的
-/// 显式密钥清零（设计 §1.3.3c「reject_after 触发即清零密钥」承诺）：关闭置位后
-/// 立即抹除密钥材料——不再等待 Core 拆解（Drop 兜底之外的显式路径；关闭后
-/// seal/open 均先查 closed，无残余密钥消费者）。
+/// Explicit key zeroing on hard reject ([`CloseReason::RejectAfter`]) /
+/// forgery teardown ([`CloseReason::ForgeLimit`]) (design §1.3.3c
+/// "reject_after zeroes keys on trigger" commitment): key material is
+/// wiped immediately once the close flag is set — not waiting for Core
+/// teardown (an explicit path beyond the Drop backstop; after close,
+/// seal/open both check `closed` first, so no residual key consumers).
 fn zeroize_keys_on_close(inner: &mut Inner) {
     inner.rekey_seed.zeroize();
     inner.send.key.zeroize();
     inner.recv.key.zeroize();
-    inner.retained_recv = None; // 旧接收密钥（DirKeys::Drop 清零）
+    inner.retained_recv = None; // old receive key (zeroized by DirKeys::Drop)
 }
 
-/// 会话核心（握手后由各泵共享）。
+/// Session core (shared by the pumps after the handshake).
 pub(crate) struct Core {
     cfg: TunnelConfig,
     inner: StdMutex<Inner>,
     closed_tx: watch::Sender<bool>,
-    /// 密钥纪元观测（rekey apply 时推进；M5 A10 的 epoch 递增观测面）。
+    /// Key-epoch observation (advances on rekey apply; the M5 A10
+    /// epoch-increment observation surface).
     epoch_tx: watch::Sender<u64>,
 }
 
@@ -1382,7 +1486,8 @@ impl Core {
         })
     }
 
-    /// 订阅密钥纪元变化（初始 0；每次 rekey apply 推进 +1）。
+    /// Subscribe to key-epoch changes (starts at 0; advances +1 on each
+    /// rekey apply).
     pub(crate) fn subscribe_epoch(&self) -> watch::Receiver<u64> {
         self.epoch_tx.subscribe()
     }
@@ -1428,7 +1533,7 @@ impl Core {
         if inner.send.counter >= cfg.reject_after.0 {
             let reason = CloseReason::RejectAfter;
             inner.closed = Some(reason);
-            zeroize_keys_on_close(inner); // §1.3.3c：reject_after 触发即清零密钥
+            zeroize_keys_on_close(inner); // §1.3.3c: reject_after zeroes keys on trigger
             return Err(SessionError::Closed(reason));
         }
         let ct = inner
@@ -1441,7 +1546,8 @@ impl Core {
         Ok(out)
     }
 
-    /// 打开一条记录：当前密钥（隐式计数 = last+1）→ 旧密钥宽限 → 失败计入伪造。
+    /// Open one record: current key (implicit counter = last+1) → old-key
+    /// grace → failure counted as forgery.
     fn open_record(&self, rtype: u8, body: &[u8]) -> Result<Vec<u8>, SessionError> {
         let mut inner = self.lock();
         if let Some(r) = inner.closed {
@@ -1453,7 +1559,9 @@ impl Core {
             inner.recv.counter += 1;
             inner.received += 1;
             inner.auth_fail_streak = 0;
-            // 新密钥首条记录 ⇒ 对端已切换，TCP 序下不再有旧密钥在途记录。
+            // First record under the new key ⇒ the peer has switched;
+            // under TCP ordering there are no more in-flight old-key
+            // records.
             inner.retained_recv = None;
             return Ok(pt);
         }
@@ -1467,9 +1575,12 @@ impl Core {
         }
         inner.forge_attempts += 1;
         inner.auth_fail_streak += 1;
-        // 失步保险丝仅在 rekey 窗口（有 pending INIT 或 retained 旧钥未收尾）内武装：
-        // 窗口内的连续失败 = 密钥失步/实现错误 ⇒ 显式 Protocol 断链（fail-loud）；
-        // 窗口外的连续失败 = 伪造洪泛，语义归 forge_limit（P0-2：100 次断链）管。
+        // The desync fuse is armed only inside rekey windows (a pending
+        // INIT or an unfinished retained old key): consecutive failures
+        // inside a window = key desync/implementation error ⇒ explicit
+        // Protocol teardown (fail-loud); consecutive failures outside a
+        // window = forgery flood, whose semantics belong to forge_limit
+        // (P0-2: teardown at 100).
         if inner.auth_fail_streak >= AUTH_FAIL_STREAK
             && (inner.pending.is_some() || inner.retained_recv.is_some())
         {
@@ -1479,19 +1590,20 @@ impl Core {
             return Err(SessionError::Closed(reason));
         }
         if inner.last_recv_ct == Some(Sha256::digest(body).into()) {
-            inner.replay_rejected += 1; // 字节级重复 = 重放向量（同时计入伪造）
+            inner.replay_rejected += 1; // byte-level duplicate = replay vector (also counted as forgery)
         }
         if inner.forge_attempts >= self.cfg.forge_limit as u64 {
             let reason = CloseReason::ForgeLimit;
             inner.closed = Some(reason);
-            zeroize_keys_on_close(&mut inner); // 断链纪律（P0-2）：达限即清零密钥
+            zeroize_keys_on_close(&mut inner); // teardown discipline (P0-2): zero keys on hitting the limit
             let _ = self.closed_tx.send(true);
             return Err(SessionError::Closed(reason));
         }
         Err(SessionError::RecordAuth)
     }
 
-    /// 定时器节拍：硬拒绝/死链判定 + rekey 触发/重试 + 心跳。返回待发（已封装）帧。
+    /// Timer tick: hard-reject/dead-link verdicts + rekey trigger/retry +
+    /// heartbeat. Returns the frames to send (already sealed).
     fn timer_tick(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let now = self.cfg.clock.now();
@@ -1500,22 +1612,24 @@ impl Core {
             return out;
         }
         let cfg = &self.cfg;
-        // 硬拒绝（双阈值：时间/计数）
+        // Hard reject (dual threshold: time/counter)
         if now.duration_since(inner.epoch_start) >= cfg.reject_after.1
             || inner.send.counter >= cfg.reject_after.0
         {
             inner.closed = Some(CloseReason::RejectAfter);
-            zeroize_keys_on_close(&mut inner); // §1.3.3c：reject_after 触发即清零密钥
+            zeroize_keys_on_close(&mut inner); // §1.3.3c: reject_after zeroes keys on trigger
             let _ = self.closed_tx.send(true);
             return out;
         }
-        // 静默死链：3×keepalive 无入站
+        // Silent dead link: 3×keepalive with no inbound
         if now.duration_since(inner.last_inbound) > cfg.keepalive.mul_f64(3.0) {
             inner.closed = Some(CloseReason::DeadLink);
             let _ = self.closed_tx.send(true);
             return out;
         }
-        // rekey：无 pending 且双阈值到点 ⇒ 发起；有 pending 且 5s 未应答 ⇒ 换临时钥重试
+        // rekey: no pending and a dual threshold reached ⇒ initiate;
+        // pending with no answer for 5s ⇒ retry with a fresh ephemeral
+        // key
         let due = inner.send.counter >= cfg.rekey_after.0
             || now.duration_since(inner.epoch_start) >= cfg.rekey_after.1;
         let has_pending = inner.pending.is_some();
@@ -1525,7 +1639,7 @@ impl Core {
                 out.push(f);
             }
         }
-        // 心跳
+        // Heartbeat
         if now.duration_since(inner.last_ping) >= cfg.keepalive {
             if let Ok(f) = Core::seal_locked(cfg, &mut inner, RT_PING, b"") {
                 out.push(f);
@@ -1535,14 +1649,18 @@ impl Core {
         out
     }
 
-    /// 生成/重生成 rekey 临时密钥并封装 REKEY_INIT（旧密钥）。
+    /// Generate/regenerate the rekey ephemeral key and seal the
+    /// REKEY_INIT (under the old key).
     fn begin_rekey_locked(
         cfg: &TunnelConfig,
         inner: &mut Inner,
         now: tokio::time::Instant,
     ) -> Result<Vec<u8>, SessionError> {
-        // 双 REKEY_INIT 碰撞的确定性裁决：临时公钥字典序小者胜（双方同算，§实现注记）。
-        // OsRng：泵任务内跨 await 需 Send（ThreadRng 为 Rc 不可跨线程）
+        // Deterministic tiebreak for dual REKEY_INIT collisions: the
+        // lexicographically smaller ephemeral public key wins (both sides
+        // compute the same; see implementation note).
+        // OsRng: pump tasks need Send across awaits (ThreadRng is Rc and
+        // not cross-thread)
         let eph = HybridKeypair::generate(&mut rand::rngs::OsRng);
         let epoch = inner.epoch;
         let mut payload = Vec::with_capacity(8 + kem::HYBRID_PUB_LEN);
@@ -1557,8 +1675,10 @@ impl Core {
         Ok(frame)
     }
 
-    /// 处理对端 REKEY_INIT：RESP 以**旧发送密钥**封装后立即切换（唯一串行点 = 写泵）。
-    /// 返回 None = 过期/碰撞弃权（对端 INIT 胜出或我们胜出）。
+    /// Handle a peer REKEY_INIT: the RESP is sealed with the **old send
+    /// key** and the switch happens immediately (the single
+    /// serialization point = the write pump). Returns None = stale/
+    /// collision yield (the peer's INIT won, or ours did).
     fn handle_rekey_init(&self, payload: &[u8]) -> Result<Option<Vec<u8>>, SessionError> {
         let mut r = Rd::new(payload);
         let epoch = r.u64()?;
@@ -1570,11 +1690,11 @@ impl Core {
             return Err(SessionError::Closed(r));
         }
         if epoch != inner.epoch {
-            return Ok(None); // 陈旧重传
+            return Ok(None); // stale retransmission
         }
         if let Some(p) = &inner.pending {
             if p.eph.public().to_bytes() < eph_bytes {
-                return Ok(None); // 我们的 INIT 胜出，弃对端的
+                return Ok(None); // our INIT wins; drop the peer's
             }
         }
         let eph_pub =
@@ -1583,9 +1703,10 @@ impl Core {
         let mut resp = Vec::with_capacity(8 + kem::HYBRID_CT_LEN);
         resp.extend_from_slice(&epoch.to_le_bytes());
         resp.extend_from_slice(&ct.to_bytes());
-        // RESP 必须用旧发送密钥封装（对端收到 RESP 才切换）。
+        // The RESP must be sealed with the old send key (the peer
+        // switches only upon receiving the RESP).
         let frame = Core::seal_locked(&self.cfg, &mut inner, RT_REKEY_RESP, &resp)?;
-        // 切换：本端为该次 rekey 的响应方。
+        // Switch: this end is the responder of this rekey.
         self.switch_locked(
             &mut inner,
             &ss,
@@ -1598,7 +1719,7 @@ impl Core {
         Ok(Some(frame))
     }
 
-    /// 处理对端 REKEY_RESP（本端 pending 的 INIT 得到应答）。
+    /// Handle a peer REKEY_RESP (our pending INIT got its answer).
     fn handle_rekey_resp(&self, payload: &[u8]) -> Result<(), SessionError> {
         let mut r = Rd::new(payload);
         let epoch = r.u64()?;
@@ -1626,7 +1747,8 @@ impl Core {
         Ok(())
     }
 
-    /// 切换到新纪元密钥。`we_are_initiator` = 本端是否为该次 rekey 的 INIT 发起方。
+    /// Switch to the new epoch's keys. `we_are_initiator` = whether this
+    /// end is the INIT initiator of this rekey.
     #[allow(clippy::too_many_arguments)]
     fn switch_locked(
         &self,
@@ -1638,14 +1760,16 @@ impl Core {
         we_are_initiator: bool,
         now: tokio::time::Instant,
     ) {
-        // th = SHA256(L ‖ epoch ‖ eph_pub ‖ ct)；ikm = ss ‖ th；salt = 旧 rekey_seed
+        // th = SHA256(L ‖ epoch ‖ eph_pub ‖ ct); ikm = ss ‖ th; salt = the
+        // old rekey_seed
         let mut h = Sha256::new();
         h.update(L_REKEY_TH);
         h.update(epoch.to_le_bytes());
         h.update(eph_pub);
         h.update(ct);
         let th: [u8; 32] = h.finalize().into();
-        // ikm/okm = 密钥材料（ss 与方向密钥的来源）：Zeroizing 包裹，Drop 清零（§1.3.3c）。
+        // ikm/okm = key material (the source of ss and the directional
+        // keys): wrapped in Zeroizing, zeroed on Drop (§1.3.3c).
         let mut ikm = Zeroizing::new(Vec::with_capacity(64));
         ikm.extend_from_slice(ss.as_bytes());
         ikm.extend_from_slice(&th);
@@ -1655,7 +1779,8 @@ impl Core {
         let resp_key: [u8; 32] = okm[32..64].try_into().expect("32B");
 
         let aead = inner.aead;
-        // initiator 发 init_key 收 resp_key；responder 发 resp_key 收 init_key。
+        // The initiator sends init_key and receives resp_key; the
+        // responder sends resp_key and receives init_key.
         let (send_key, recv_key) = if we_are_initiator {
             (init_key, resp_key)
         } else {
@@ -1674,13 +1799,13 @@ impl Core {
             counter: 0,
             key: send_key,
         };
-        inner.retained_recv = Some(old_recv); // 在途旧记录宽限（旧 DirKeys 的 key 随其 Drop 清零）
+        inner.retained_recv = Some(old_recv); // grace for in-flight old records (the old DirKeys' key is zeroized with its Drop)
         inner.rekey_seed = okm[64..96].try_into().expect("32B");
         inner.epoch = epoch + 1;
         inner.epoch_start = now;
         inner.rekeys += 1;
         inner.pending = None;
-        let _ = self.epoch_tx.send(inner.epoch); // 纪元观测面（A10）
+        let _ = self.epoch_tx.send(inner.epoch); // epoch observation surface (A10)
     }
 
     fn stats(&self) -> SessionStats {
@@ -1699,17 +1824,24 @@ impl Core {
 }
 
 // ============================================================================
-// 会话泵（读/写/复用驱动）
+// Session pumps (read/write/mux drivers)
 // ============================================================================
 
-/// 读泵→写泵的控制转发（唯一串行点 = 写泵，保计数器顺序 = 实际上线顺序）。
-/// 读泵→写泵的控制转发。
+/// Control forwarding read-pump → write-pump (the single serialization
+/// point = the write pump, keeping counter order = actual wire order).
+/// Control forwarding read-pump → write-pump.
 ///
-/// 密封纪律（本批修复的竞态注记）：**INIT 的处理（seal RESP + 切换）留在写泵**——写泵是
-/// 唯一密封点，保证「密封序 = 上线序 = 计数器序」；**RESP 的切换（handle_rekey_resp）在
-/// 读泵同步执行**——若经通道异步转发，读泵会在写泵应用 RESP 前抢先读到新纪元记录，
-/// 旧钥解新钥 ⇒ 误判伪造并静默丢弃，且丢弃 K 条后计数器永久错位（一次命中即隧道死亡，
-/// 独立复核实测单次 rekey 丢 128KiB+ 计 18 次伪造）。
+/// Sealing discipline (note on the race fixed in this batch): **INIT
+/// handling (seal RESP + switch) stays in the write pump** — the write
+/// pump is the single sealing point, guaranteeing "sealing order = wire
+/// order = counter order"; **the RESP switch (handle_rekey_resp) runs
+/// synchronously in the read pump** — if it were forwarded
+/// asynchronously over a channel, the read pump would read new-epoch
+/// records before the write pump applied the RESP, opening the new key
+/// with the old key ⇒ misjudged as forgery and silently dropped, and
+/// after K drops the counter is permanently misaligned (a single hit
+/// kills the tunnel; independent review measured a single rekey losing
+/// 128KiB+ across 18 forgery counts).
 enum CtrlCmd {
     Pong,
     PeerInit(Vec<u8>),
@@ -1731,11 +1863,12 @@ async fn write_pump<W>(
     let mut data_done = false;
 
     loop {
-        // 待发数据优先落地（保持提交序），随后回到 select。
+        // Pending data lands first (preserving submission order), then
+        // back to select.
         if let Some(p) = pending_data.take() {
             let frame = match core.seal_frame(RT_DATA, &p) {
                 Ok(f) => f,
-                Err(_) => break, // 会话终止/硬拒绝
+                Err(_) => break, // session terminated/hard reject
             };
             if let Err(e) = w.write_all(&frame).await {
                 core.kill(CloseReason::Io);
@@ -1808,7 +1941,7 @@ async fn read_pump<R>(
     let mut closed = core.subscribe_closed();
     let mut hdr = [0u8; 5];
     loop {
-        // 头部（含终止守卫）
+        // Header (with the termination guard)
         let r0 = tokio::select! {
             biased;
             _ = closed.changed() => break,
@@ -1848,15 +1981,21 @@ async fn read_pump<R>(
                     }
                 }
                 RT_PING => {
-                    // PONG 周期性重发，通道满丢弃无害。
+                    // PONG is re-sent periodically; dropping on a full
+                    // channel is harmless.
                     let _ = ctrl_tx.try_send(CtrlCmd::Pong);
                 }
                 RT_PONG => {}
                 RT_REKEY_INIT => {
-                    // INIT 必达（RESP 由写泵密封，若丢则对端 5s 重试期间本端已切换、
-                    // 重复 INIT 被陈旧判定忽略 ⇒ 对端只能等 180s 硬拒绝）。通道满时等待
-                    // 写泵消费（closed 守卫防挂）；极端双向 socket 饱和下退化为死链检测
-                    // 断链（fail-loud），不会静默丢数据。
+                    // The INIT must arrive (the RESP is sealed by the
+                    // write pump; if lost, this end has already switched
+                    // during the peer's 5s retry and the duplicate INIT is
+                    // ignored by the stale check ⇒ the peer can only wait
+                    // for the 180s hard reject). On a full channel, wait
+                    // for the write pump to consume (the closed guard
+                    // prevents hanging); under extreme bidirectional
+                    // socket saturation this degrades to dead-link-detect
+                    // teardown (fail-loud), never silently dropping data.
                     let sent = tokio::select! {
                         biased;
                         _ = closed.changed() => None,
@@ -1868,8 +2007,10 @@ async fn read_pump<R>(
                     }
                 }
                 RT_REKEY_RESP => {
-                    // 同步应用切换（不转发）：见 CtrlCmd 文档的密封纪律注记——
-                    // 抢在切换前读入的新纪元记录必须能立刻用新钥解开。
+                    // Apply the switch synchronously (no forwarding): see
+                    // the sealing-discipline note in the CtrlCmd docs —
+                    // new-epoch records read ahead of the switch must
+                    // open immediately with the new key.
                     if core.handle_rekey_resp(&payload).is_err() {
                         core.kill(CloseReason::Protocol);
                         break;
@@ -1880,9 +2021,11 @@ async fn read_pump<R>(
                     break;
                 }
             },
-            Err(SessionError::Closed(_)) => break, // 伪造断链等
+            Err(SessionError::Closed(_)) => break, // forgery teardown etc.
             Err(_) => {
-                // 记录认证失败已计入伪造；继续读（限额由 timer/计数判定）。
+                // The record authentication failure is already counted as
+                // forgery; keep reading (the limit is verdicted by
+                // timer/counter).
             }
         }
         core.note_inbound();
@@ -1890,7 +2033,7 @@ async fn read_pump<R>(
     core.kill(CloseReason::PeerClosed);
 }
 
-/// yamux 驱动命令。
+/// Yamux driver command.
 enum MuxCmd {
     Open {
         prio: Prio,
@@ -1942,8 +2085,10 @@ async fn mux_driver(
                     Poll::Pending => pending_open = Some((prio, resp)),
                 }
             }
-            // 入站流：循环抽干（同一 poll_fn 内连取，避免「投递后返回 Pending 但 yamux
-            // 内部还有已缓冲的入站流」的唤醒缺口——之后不会再有新 socket 数据来唤醒）。
+            // Inbound streams: drain in a loop (taking repeatedly within
+            // the same poll_fn, avoiding the wakeup gap of "delivered,
+            // returned Pending, but yamux still has buffered inbound
+            // streams" — no new socket data would ever wake us again).
             loop {
                 if pending_inbound.is_none() {
                     match conn.poll_next_inbound(cx) {
@@ -1964,7 +2109,7 @@ async fn mux_driver(
                     Ok(()) => continue,
                     Err(mpsc::error::TrySendError::Full(s)) => {
                         pending_inbound = Some(s.into_inner());
-                        break; // 入站通道满：背压，等消费者取走再被唤醒
+                        break; // inbound channel full: backpressure, wait for a consumer to take before rewaking
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => return Poll::Ready(true),
                 }
@@ -1982,7 +2127,8 @@ async fn mux_driver(
 // Tunnel
 // ============================================================================
 
-/// 建立后的隧道会话（深模块：握手/记录层/抗重放/rekey/心跳全部内藏）。
+/// The established tunnel session (deep module: handshake/record
+// layer/anti-replay/rekey/heartbeat all built in).
 pub struct Tunnel {
     core: Arc<Core>,
     cmd_tx: futures::channel::mpsc::Sender<MuxCmd>,
@@ -1991,7 +2137,8 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    /// 打开一条出站逻辑流（yamux 内跑，加密对中转不可见）。
+    /// Open an outbound logical stream (runs inside yamux; the encryption
+    /// is invisible to the relay).
     pub async fn open_stream(&self, prio: Prio) -> io::Result<Stream> {
         let (tx, rx) = oneshot::channel();
         let mut cmd = self.cmd_tx.clone();
@@ -2002,40 +2149,46 @@ impl Tunnel {
             .map_err(|_| io::Error::other("mux: driver dropped open"))?
     }
 
-    /// 打开 TUN 包通道（`[u16 len][ip packet]` 帧化，VPN-14）。
+    /// Open a TUN packet channel (`[u16 len][ip packet]` framing,
+    /// VPN-14).
     pub async fn open_packet_channel(&self) -> io::Result<PacketChannel> {
         let s = self.open_stream(Prio::Normal).await?;
         Ok(PacketChannel::from_stream(s))
     }
 
-    /// 接受一条对端打开的逻辑流（`None` = 复用器终止）。
+    /// Accept a peer-opened logical stream (`None` = multiplexer
+    /// terminated).
     pub async fn accept_stream(&self) -> Option<Stream> {
         self.inbound_rx.lock().await.recv().await
     }
 
-    /// 会话统计。
+    /// Session statistics.
     pub fn stats(&self) -> SessionStats {
         self.core.stats()
     }
 
-    /// 订阅密钥纪元（每次 rekey apply 推进；客户端装配层的 A10 观测面）。
+    /// Subscribe to the key epoch (advances on each rekey apply; the A10
+    /// observation surface for client assembly layers).
     pub fn epoch_watch(&self) -> tokio::sync::watch::Receiver<u64> {
         self.core.subscribe_epoch()
     }
 
-    /// 对端设备标识（服务端侧；客户端侧为 `None`）。
+    /// Peer device identifier (server side; `None` on the client side).
     pub fn peer_device_id(&self) -> Option<DeviceId> {
         self.core.lock().peer_device
     }
 
-    /// 对端服务器标识（客户端侧；服务端侧为 `None`）。
+    /// Peer server identifier (client side; `None` on the server side).
     pub fn peer_server_id(&self) -> Option<ServerId> {
         self.core.lock().peer_server
     }
 
-    /// 优雅关闭：yamux GoAway/FIN → 拆会话（对端观察到 EOF）。
+    /// Graceful shutdown: yamux GoAway/FIN → tear down the session (the
+    /// peer observes EOF).
     pub async fn shutdown(mut self) {
-        // Tunnel 实现 Drop（防泄漏终止泵），不能解构 self——经克隆句柄做优雅关闭。
+        // Tunnel implements Drop (leak-proof pump termination), so self
+        // cannot be destructured — graceful shutdown goes through cloned
+        // handles.
         let mut cmd = self.cmd_tx.clone();
         let _ = futures::SinkExt::send(&mut cmd, MuxCmd::Shutdown).await;
         drop(cmd);
@@ -2043,7 +2196,7 @@ impl Tunnel {
         for t in tasks {
             let _ = tokio::time::timeout(Duration::from_secs(3), t).await;
         }
-        drop(self); // Drop：kill(SessionClosed) 终止各泵
+        drop(self); // Drop: kill(SessionClosed) terminates the pumps
     }
 }
 
@@ -2057,7 +2210,8 @@ impl fmt::Debug for Tunnel {
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        // 未显式 shutdown 的丢弃同样触发各泵终止（watch 广播）。
+        // A drop without an explicit shutdown likewise triggers pump
+        // termination (watch broadcast).
         self.core.kill(CloseReason::SessionClosed);
     }
 }
@@ -2093,12 +2247,13 @@ where
 }
 
 // ============================================================================
-// 握手：已钉扎 1-RTT
+// Handshake: pinned 1-RTT
 // ============================================================================
 
-/// 已钉扎 1-RTT 发起（Noise IK 结构 + 混合 KEM，§1.3.3c）。
+/// Pinned 1-RTT initiation (Noise IK structure + hybrid KEM, §1.3.3c).
 ///
-/// UKS 防护：设备签名覆盖 I1 全部已发字段 + 协议上下文（cluster_id/期望服务器身份）。
+/// UKS protection: the device signature covers all sent fields of I1
+/// plus the protocol context (cluster_id/expected server identity).
 pub async fn initiate<S>(
     mut io: S,
     device: &DeviceStaticKeys,
@@ -2108,12 +2263,16 @@ pub async fn initiate<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // OsRng：随机源跨 await 存续，必须 Send+Sync（ThreadRng 是 Rc）
+    // OsRng: the randomness source survives across awaits, must be
+    // Send+Sync (ThreadRng is Rc)
     let mut rng = rand::rngs::OsRng;
 
-    // 1) 混合份额：X25519(e, s_srv) + ML-KEM ct 封给服务器静态混合公钥
-    //（e 用 StaticSecret 生成：同一临时密钥要做 es 与 ee 两次 DH，EphemeralSecret 的
-    //  diffie_hellman 按值消费不可复用；此处一次性使用后随函数结束销毁，语义等同）
+    // 1) Hybrid shares: X25519(e, s_srv) + ML-KEM ct encapsulated to the
+    // server's static hybrid public key (e is generated as a
+    // StaticSecret: the same ephemeral key must do both the es and ee
+    // DHs, and EphemeralSecret's diffie_hellman consumes by value and is
+    // not reusable; here it is used once and destroyed at function end —
+    // semantically equivalent)
     let e = StaticSecret::random_from_rng(&mut bridge(&mut rng));
     let e_pub: [u8; 32] = XPub::from(&e).to_bytes();
     let (ml_ct, ml_ss) = expect_server
@@ -2126,11 +2285,13 @@ where
         return Err(SessionError::Handshake("non-contributory server key"));
     }
     let k1 = k1_from_shares(x_ss.as_bytes(), ml_ss.as_slice());
-    // k1/k_enc = 握手密钥材料：Zeroizing 包裹，Drop 清零（§1.3.3c）。
+    // k1/k_enc = handshake key material: wrapped in Zeroizing, zeroed on
+    // Drop (§1.3.3c).
     let mut k_enc = Zeroizing::new([0u8; 32]);
     hkdf_sha256(&[], &k1[..], L_I1_ENC, &mut k_enc[..]);
 
-    // 2) I1：算法集 = 本端偏好序；期望身份 = pin 的 entry.identity_pub
+    // 2) I1: algorithm set = this end's preference order; expected
+    // identity = the pin's entry.identity_pub
     let aead_list = cfg.aead.encode();
     let dev_x: [u8; 32] = device.x25519_public().to_bytes();
     let dev_ed: [u8; 32] = *device.ed25519_public().as_bytes();
@@ -2172,7 +2333,8 @@ where
     if !cfg.aead.order.contains(&chosen) {
         return Err(SessionError::Handshake("chosen aead not offered"));
     }
-    // 服务器身份签名（P0-5 隧道侧）：覆盖 I1‖R1 transcript
+    // Server identity signature (P0-5 tunnel side): covers the I1‖R1
+    // transcript
     let sig_ctx = r1_sig_context(
         &expect_server.cluster_id,
         &dev_ed,
@@ -2189,7 +2351,7 @@ where
     {
         return Err(SessionError::Handshake("server signature"));
     }
-    // 密钥确认：R1.confirm 以 confirm_s 封装
+    // Key confirmation: R1.confirm is sealed with confirm_s
     let ee = e.diffie_hellman(&XPub::from(msg.eph_srv));
     if !ee.was_contributory() {
         return Err(SessionError::Handshake("non-contributory eph"));
@@ -2208,7 +2370,7 @@ where
 }
 
 // ============================================================================
-// 握手：TOFU 首连 2-RTT
+// Handshake: TOFU first-connect 2-RTT
 // ============================================================================
 
 impl<S> fmt::Debug for TofuBootstrap<S> {
@@ -2223,10 +2385,14 @@ impl<S> fmt::Debug for TofuBootstrap<S> {
     }
 }
 
-/// TOFU 引导中间态：已收 R0 并验凭证链，等用户确认根指纹后 [`TofuBootstrap::confirm`]。
+/// TOFU bootstrap intermediate state: R0 received and the credential
+/// chain verified, waiting for the user to confirm the root fingerprint
+/// before [`TofuBootstrap::confirm`].
 ///
-/// **残余风险明示**：TOFU 不防首登在线 MITM（§1.3.3f/§2.5-3）；根指纹确认 UI
-/// 不得静默。组织场景走邀请文件强路径。
+/// **Residual risk stated plainly**: TOFU does not defend against an
+/// online MITM at first login (§1.3.3f/§2.5-3); the root-fingerprint
+/// confirmation UI must not be silent. Organizational settings use the
+/// strong invite-file path.
 pub struct TofuBootstrap<S> {
     io: S,
     device: DeviceStaticKeys,
@@ -2235,36 +2401,45 @@ pub struct TofuBootstrap<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> TofuBootstrap<S> {
-    /// 集群根公钥指纹（展示给用户确认的本体）。
+    /// Cluster root public-key fingerprint (the thing displayed for user
+    /// confirmation).
     pub fn root_fingerprint(&self) -> Fingerprint {
         fingerprint_ed25519(&self.pin.cluster_root_pub)
     }
 
-    /// R0 出示的集群根公钥（确认后交 `trust::PinStore` 钉扎的本体）。
+    /// The cluster root public key presented in R0 (what gets pinned into
+    /// `trust::PinStore` after confirmation).
     pub fn root_pub(&self) -> &VerifyingKey {
         &self.pin.cluster_root_pub
     }
 
-    /// 期望集群。
+    /// Expected cluster.
     pub fn cluster_id(&self) -> ClusterId {
         self.pin.cluster_id
     }
 
-    /// R0 出示的服务器接入材料（入群凭证公开部分）。
+    /// The server access material presented in R0 (the public part of
+    /// the join credential).
     pub fn server_entry(&self) -> &ServerEntry {
         &self.pin.entry
     }
 
-    /// 用户确认后：按钉扎形态发 I1/R1（此连接仍 2-RTT 总计；**此后任何端点不再出现 I0**）。
+    /// After user confirmation: send I1/R1 in the pinned form (this
+    /// connection is still 2-RTT total; **afterwards no endpoint ever
+    /// produces I0 again**).
     pub async fn confirm(self) -> Result<Tunnel, SessionError> {
         initiate(self.io, &self.device, &self.pin, self.cfg).await
     }
 }
 
-/// TOFU 首连发起（I0 → R0，返回待确认引导态）。
+/// TOFU first-connect initiation (I0 → R0; returns the bootstrap state
+/// awaiting confirmation).
 ///
-/// R0 验证：入群凭证 = 根公钥对 ServerEntry 的签名（材料链可信）+ 服务器身份对
-/// I0‖R0 的签名。注意根公钥是 R0 自assert 的——这正是 TOFU 残余风险的落点。
+/// R0 verification: join credential = the root public key's signature
+/// over the ServerEntry (a trustworthy material chain) + the server
+/// identity's signature over I0‖R0. Note the root public key is
+/// self-asserted by R0 — that is exactly where the TOFU residual risk
+/// lands.
 pub async fn initiate_tofu<S>(
     mut io: S,
     device: DeviceStaticKeys,
@@ -2316,11 +2491,13 @@ where
         identity_pub,
         static_hybrid_pub,
     };
-    // 入群凭证：根公钥对 ServerEntry 的签名
+    // Join credential: the root public key's signature over the
+    // ServerEntry
     if !verify_server_entry(&root_pub, &cluster_id, &entry, &entry_sig) {
         return Err(SessionError::Handshake("enrollment signature"));
     }
-    // 服务器身份对 I0‖R0（除自身 sig 外的全部字节）的签名
+    // The server identity's signature over I0‖R0 (all bytes except its
+    // own sig)
     let sig_len = r0.len() - 64;
     let mut sig_ctx = Vec::with_capacity(SIG_R0.len() + i0.len() + sig_len);
     sig_ctx.extend_from_slice(SIG_R0);
@@ -2343,13 +2520,16 @@ where
 }
 
 // ============================================================================
-// 握手：服务端 respond
+// Handshake: server respond
 // ============================================================================
 
-/// 服务端应答：接受 I1（已钉扎）或 I0→R0→I1（TOFU 首连）。
+/// Server respond: accepts I1 (pinned) or I0→R0→I1 (TOFU
+/// first-connect).
 ///
-/// 设备目录三态：NotFound/Revoked/公钥不匹配 → 同一不透明 [`SessionError::DeviceRejected`]
-/// （时序对齐：三者均在完成 I1 解密与设备签名验证之后判定）。
+/// Device-directory three states: NotFound/Revoked/public-key mismatch
+/// → the same opaque [`SessionError::DeviceRejected`] (timing-aligned:
+/// all three are verdicted after completing I1 decryption and device
+/// signature verification).
 pub async fn respond<S>(
     mut io: S,
     server: &ServerIdentity,
@@ -2360,13 +2540,16 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (t, payload) = recv_frame(&mut io).await?;
-    // 握手形态观测面（M5 断言 A5/A16 的「I0 不得出现」grep 面）：TOFU 引导路径
-    // 显式留痕；钉扎 1-RTT（RT_I1 直达）在会话建立时打印。
+    // Handshake-form observation surface (the M5 assertion A5/A16 "I0
+    // must not appear" grep surface): the TOFU bootstrap path leaves an
+    // explicit trace; the pinned 1-RTT (RT_I1 direct) prints at session
+    // establishment.
     let mut via_tofu = false;
     let i1 = match t {
         RT_I1 => payload,
         RT_I0 => {
-            // TOFU 首连：R0 出示入群凭证链 + 集群根公钥，随后等 I1
+            // TOFU first-connect: R0 presents the join credential chain +
+            // the cluster root public key, then waits for I1
             eprintln!("session: TOFU bootstrap (I0) received -- 2-RTT path");
             via_tofu = true;
             let mut r = Rd::new(&payload);
@@ -2389,7 +2572,7 @@ where
             r0.extend_from_slice(entry.identity_pub.as_bytes());
             r0.extend_from_slice(&entry.static_hybrid_pub.to_bytes());
             r0.extend_from_slice(&server.entry_sig.to_bytes());
-            // 服务器身份对 I0‖R0(除 sig 外) 的签名
+            // The server identity's signature over I0‖R0 (minus the sig)
             let mut sig_ctx = Vec::with_capacity(SIG_R0.len() + payload.len() + r0.len());
             sig_ctx.extend_from_slice(SIG_R0);
             sig_ctx.extend_from_slice(&payload);
@@ -2407,15 +2590,17 @@ where
         other => return Err(SessionError::UnexpectedMessage(other)),
     };
 
-    // —— I1 处理（两种形态共用）——
+    // —— I1 handling (shared by both forms) ——
     let msg = parse_i1(&i1)?;
-    // UKS 核心检查：I1 携带的期望身份必须是本机（签名上下文由客户端按期望身份构造）
+    // Core UKS check: the expected identity carried by I1 must be this
+    // machine (the client builds the signature context from the expected
+    // identity)
     if msg.expected_identity != *server.identity.verifying_key().as_bytes() {
         return Err(SessionError::Handshake("expected-server-identity"));
     }
     let client_list = parse_aead_list(&msg.aead_list)?;
 
-    // 混合解封
+    // Hybrid decapsulation
     let ml_ct: Ciphertext<MlKem768> = Ciphertext::<MlKem768>::try_from(&msg.ml_ct[..])
         .map_err(|_| SessionError::Protocol("ml ct"))?;
     let ml_ss = server
@@ -2430,11 +2615,13 @@ where
         return Err(SessionError::Handshake("non-contributory e"));
     }
     let k1 = k1_from_shares(x_ss.as_bytes(), ml_ss.as_slice());
-    // k1/k_enc = 握手密钥材料：Zeroizing 包裹，Drop 清零（§1.3.3c）。
+    // k1/k_enc = handshake key material: wrapped in Zeroizing, zeroed on
+    // Drop (§1.3.3c).
     let mut k_enc = Zeroizing::new([0u8; 32]);
     hkdf_sha256(&[], &k1[..], L_I1_ENC, &mut k_enc[..]);
 
-    // 解密设备身份载荷（AAD = I1 已发字段前缀）
+    // Decrypt the device identity payload (AAD = the sent-fields prefix
+    // of I1)
     let aad_len = 1 + msg.aead_list.len() + 32 + 32 + kem::ML_KEM_CT_LEN;
     let aad = &i1[..aad_len];
     let (enc_body, tag) = msg.enc.split_at(msg.enc.len() - 16);
@@ -2460,7 +2647,8 @@ where
     let dev_ed_vk =
         VerifyingKey::from_bytes(&dev_ed).map_err(|_| SessionError::Handshake("device ed key"))?;
 
-    // 设备签名覆盖：I1 全部已发字段 + 协议上下文（cluster_id/期望身份=本机身份）
+    // Device signature coverage: all sent fields of I1 + the protocol
+    // context (cluster_id/expected identity = this machine's identity)
     let sig_ctx = i1_sig_context(
         &server.cluster_id,
         server.identity.verifying_key().as_bytes(),
@@ -2477,7 +2665,8 @@ where
         return Err(SessionError::Handshake("device signature"));
     }
 
-    // 设备目录三态（时序对齐：同一不透明错误）
+    // Device-directory three states (timing-aligned: the same opaque
+    // error)
     let device_id = DeviceId::from_ed25519(&dev_ed_vk);
     match dir.lookup(&device_id).await {
         LookupVerdict::Active(rec) => {
@@ -2490,9 +2679,9 @@ where
         }
     }
 
-    // 协商 + R1
+    // Negotiate + R1
     let chosen = negotiate(&cfg.aead, &client_list).ok_or(SessionError::AeadMismatch)?;
-    let mut rng = rand::rngs::OsRng; // 同上：跨 await 的 Send 约束
+    let mut rng = rand::rngs::OsRng; // as above: the Send constraint across awaits
     let eph_srv = StaticSecret::random_from_rng(&mut bridge(&mut rng));
     let eph_srv_pub: [u8; 32] = XPub::from(&eph_srv).to_bytes();
     let th = transcript_hash(&i1, chosen, &eph_srv_pub);
@@ -2511,7 +2700,8 @@ where
     );
     let srv_sig = server.identity.sign(&sig_ctx);
 
-    // 密钥确认（服务器→客户端）：confirm_s 封装固定标签，AAD = transcript
+    // Key confirmation (server→client): confirm_s seals a fixed label,
+    // AAD = transcript
     let confirm_cipher = make_cipher(chosen, &tk.confirm_s);
     let confirm = confirm_cipher.seal(0, &th, L_CONFIRM);
 
@@ -2536,7 +2726,8 @@ where
 }
 
 // ============================================================================
-// 单元测试（内部向量：记录层/协商/密钥日程/rekey 状态机/定时器）
+// Unit tests (internal vectors: record layer/negotiation/key
+// schedule/rekey state machine/timers)
 // ============================================================================
 
 #[cfg(test)]
@@ -2557,12 +2748,13 @@ mod tests {
             negotiate(&server, &[AeadChoice::XChaCha20Poly1305]),
             Some(AeadChoice::XChaCha20Poly1305)
         );
-        // 服务器主档在客户端列表 ⇒ 取服务器序第一个交集
+        // The server's primary tier is in the client's list ⇒ take the
+        // first intersection in server order
         assert_eq!(
             negotiate(&server, &[AeadChoice::Aes256GcmSiv, AeadChoice::Aes256Gcm]),
             Some(AeadChoice::Aes256Gcm)
         );
-        // 无交集
+        // No intersection
         let only_gcm = AeadPreference::only(AeadChoice::Aes256Gcm);
         assert_eq!(negotiate(&only_gcm, &[AeadChoice::XChaCha20Poly1305]), None);
     }
@@ -2572,10 +2764,10 @@ mod tests {
         let pref = AeadPreference::default();
         let list = parse_aead_list(&pref.encode()).expect("valid list");
         assert_eq!(list, pref.order);
-        assert!(parse_aead_list(&[1, 9]).is_err(), "未知算法码");
-        assert!(parse_aead_list(&[2, 1, 1]).is_err(), "重复档位");
-        assert!(parse_aead_list(&[0]).is_err(), "空列表");
-        assert!(parse_aead_list(&[2, 1]).is_err(), "长度不符");
+        assert!(parse_aead_list(&[1, 9]).is_err(), "unknown algorithm code");
+        assert!(parse_aead_list(&[2, 1, 1]).is_err(), "duplicate tier");
+        assert!(parse_aead_list(&[0]).is_err(), "empty list");
+        assert!(parse_aead_list(&[2, 1]).is_err(), "length mismatch");
     }
 
     #[test]
@@ -2598,12 +2790,12 @@ mod tests {
         let (c, s) = paired_cores(AeadChoice::Aes256Gcm, TunnelConfig::default());
         let frame = c.seal_frame(RT_DATA, b"x").expect("seal");
         let mut tampered = frame.clone();
-        tampered[4] = RT_PING; // 篡改 type 字节（AAD 覆盖）
+        tampered[4] = RT_PING; // tamper the type byte (covered by the AAD)
         assert!(
             s.open_record(RT_PING, &tampered[5..]).is_err(),
-            "type 进 AAD"
+            "type is in the AAD"
         );
-        assert_eq!(s.stats().forge_attempts, 1, "计入伪造");
+        assert_eq!(s.stats().forge_attempts, 1, "counted as forgery");
     }
 
     #[test]
@@ -2611,14 +2803,17 @@ mod tests {
         let (c, s) = paired_cores(AeadChoice::Aes256Gcm, TunnelConfig::default());
         let frame = c.seal_frame(RT_DATA, b"first").expect("seal");
         let body = frame[5..].to_vec();
-        assert!(s.open_record(RT_DATA, &body).is_ok(), "首收");
-        // 字节级重放：隐式计数 = last+1 ⇒ 认证失败 ⇒ 计伪造 + 记重放
-        let err = s.open_record(RT_DATA, &body).expect_err("重放必拒");
+        assert!(s.open_record(RT_DATA, &body).is_ok(), "first receive");
+        // Byte-level replay: implicit counter = last+1 ⇒ authentication
+        // failure ⇒ counted as forgery + recorded as replay
+        let err = s
+            .open_record(RT_DATA, &body)
+            .expect_err("replays must be rejected");
         assert!(matches!(err, SessionError::RecordAuth));
         let st = s.stats();
         assert_eq!(st.forge_attempts, 1);
         assert_eq!(st.replay_rejected, 1);
-        // 正常后续记录仍可收（计数器前进）
+        // Normal subsequent records still arrive (the counter advanced)
         let f2 = c.seal_frame(RT_DATA, b"second").expect("seal");
         assert!(s.open_record(RT_DATA, &f2[5..]).is_ok());
     }
@@ -2636,9 +2831,11 @@ mod tests {
             junk[0] = i as u8;
             assert!(s.open_record(RT_DATA, &junk).is_err());
         }
-        assert_eq!(s.stats().closed, None, "99 次不断");
+        assert_eq!(s.stats().closed, None, "99 attempts do not tear down");
         junk[0] = 99;
-        let err = s.open_record(RT_DATA, &junk).expect_err("第 100 次断链");
+        let err = s
+            .open_record(RT_DATA, &junk)
+            .expect_err("the 100th tears down");
         assert!(matches!(err, SessionError::Closed(CloseReason::ForgeLimit)));
         assert_eq!(s.stats().closed, Some(CloseReason::ForgeLimit));
         assert_eq!(s.stats().forge_attempts, 100);
@@ -2647,7 +2844,9 @@ mod tests {
     #[test]
     fn rekey_handshake_key_agreement_and_counter_reset() {
         let clock = Arc::new(ManualClock::new());
-        // keepalive 放大隔离死链判定（单测无对端回包，注入时钟会触发 3×keepalive 静默）
+        // Enlarge keepalive to isolate the dead-link verdict (unit tests
+        // have no peer replies; the injected clock would trigger the
+        // 3×keepalive silence)
         let cfg = TunnelConfig {
             clock: clock.clone(),
             keepalive: Duration::from_secs(3600),
@@ -2655,43 +2854,50 @@ mod tests {
         };
         let (c, s) = paired_cores(AeadChoice::Aes256Gcm, cfg);
 
-        // 先各发一条并按序投递对端（隐式计数 = last+1 的前提：TCP 序仿真）
+        // First each side sends one record, delivered in order (the
+        // premise of implicit counter = last+1: TCP-order emulation)
         let f1 = c.seal_frame(RT_DATA, b"a").unwrap();
         let f2 = s.seal_frame(RT_DATA, b"b").unwrap();
         open_with(&s, RT_DATA, &f1[5..]).expect("server opens data0");
         open_with(&c, RT_DATA, &f2[5..]).expect("client opens data0");
 
-        // client 触发 rekey（注入时钟越过 120s 阈值）：INIT 以旧发送密钥封装
+        // Client triggers a rekey (the injected clock crosses the 120s
+        // threshold): the INIT is sealed with the old send key
         clock.advance(Duration::from_secs(121));
         let frames = c.timer_tick();
         let init = frames
             .iter()
             .find(|f| f[4] == RT_REKEY_INIT)
-            .expect("REKEY_INIT 发出");
+            .expect("REKEY_INIT sent");
         let payload = open_with(&s, RT_REKEY_INIT, &init[5..]).expect("server opens INIT");
         let resp_frame = s
             .handle_rekey_init(&payload)
             .expect("handle")
             .expect("RESP");
-        assert_eq!(s.stats().epoch, 1, "响应方立即切换");
+        assert_eq!(s.stats().epoch, 1, "the responder switches immediately");
         assert_eq!(s.stats().rekeys, 1);
 
-        // RESP 以旧发送密钥封装（本端仍持旧接收密钥可开），随后新密钥计数从 0 起
+        // The RESP is sealed with the old send key (this end still holds
+        // the old receive key to open it); afterwards the new-key counter
+        // starts at 0
         let resp_payload =
             open_with(&c, RT_REKEY_RESP, &resp_frame[5..]).expect("client opens RESP");
         c.handle_rekey_resp(&resp_payload).expect("switch");
         assert_eq!(c.stats().epoch, 1);
         assert_eq!(c.stats().rekeys, 1);
 
-        // 新纪元双向通信 + 计数器随新密钥重置
+        // Bidirectional communication in the new epoch + the counter
+        // resets with the new keys
         let f = c.seal_frame(RT_DATA, b"new epoch").unwrap();
         let pt = open_with(&s, RT_DATA, &f[5..]).expect("server opens new-key record");
         assert_eq!(pt, b"new epoch");
         let g = s.seal_frame(RT_DATA, b"ack").unwrap();
         let pt2 = open_with(&c, RT_DATA, &g[5..]).expect("client opens new-key record");
         assert_eq!(pt2, b"ack");
-        // 旧密钥帧（rekey 前已发未达）走 retained 宽限路径：由 tests/session_mux.rs 的
-        // replay/forge proxy 集成覆盖（此处旧密钥材料已被替换，无法再造旧帧）。
+        // Old-key frames (sent before the rekey but not yet arrived) take
+        // the retained grace path: covered by the replay/forge proxy
+        // integration in tests/session_mux.rs (here the old key material
+        // has been replaced, so old frames cannot be recreated).
     }
 
     fn open_with(core: &Core, rtype: u8, body: &[u8]) -> Option<Vec<u8>> {
@@ -2701,7 +2907,8 @@ mod tests {
     #[test]
     fn timer_triggers_rekey_at_injected_120s() {
         let clock = Arc::new(ManualClock::new());
-        // keepalive 放大避免测试内触发心跳干扰断言
+        // Enlarge keepalive to avoid heartbeat interference with the
+        // assertions inside the test
         let cfg = TunnelConfig {
             keepalive: Duration::from_secs(3600),
             clock: clock.clone(),
@@ -2712,19 +2919,19 @@ mod tests {
         clock.advance(Duration::from_secs(119));
         assert!(
             !c.timer_tick().iter().any(|f| f[4] == RT_REKEY_INIT),
-            "119s 不触发"
+            "119s does not trigger"
         );
         clock.advance(Duration::from_secs(2));
         assert!(
             c.timer_tick().iter().any(|f| f[4] == RT_REKEY_INIT),
-            "120s 触发 rekey"
+            "120s triggers rekey"
         );
     }
 
     #[test]
     fn timer_hard_reject_at_injected_180s() {
         let clock = Arc::new(ManualClock::new());
-        // keepalive 放大隔离 DeadLink 判定
+        // Enlarge keepalive to isolate the DeadLink verdict
         let cfg = TunnelConfig {
             keepalive: Duration::from_secs(3600),
             clock: clock.clone(),
@@ -2733,14 +2940,14 @@ mod tests {
         let (c, _s) = paired_cores(AeadChoice::Aes256Gcm, cfg);
 
         clock.advance(Duration::from_secs(120));
-        let _ = c.timer_tick(); // REKEY_INIT（无 RESP）
+        let _ = c.timer_tick(); // REKEY_INIT (no RESP)
         assert_eq!(c.stats().closed, None);
-        clock.advance(Duration::from_secs(61)); // 181s：rekey 未完成
+        clock.advance(Duration::from_secs(61)); // 181s: rekey unfinished
         let _ = c.timer_tick();
         assert_eq!(
             c.stats().closed,
             Some(CloseReason::RejectAfter),
-            "180s 硬拒绝"
+            "180s hard reject"
         );
     }
 
@@ -2758,7 +2965,7 @@ mod tests {
         assert_eq!(
             c.stats().closed,
             Some(CloseReason::DeadLink),
-            "3×keepalive 静默断链"
+            "3×keepalive silence tears down"
         );
     }
 
@@ -2767,10 +2974,11 @@ mod tests {
         let a = derive_traffic(&[1; 32], &[2; 32], &[3; 32], AeadChoice::Aes256Gcm);
         let b = derive_traffic(&[1; 32], &[2; 32], &[3; 32], AeadChoice::Aes256Gcm);
         assert_eq!(a.c2s, b.c2s);
-        assert_ne!(a.c2s, a.s2c, "方向密钥独立");
+        assert_ne!(a.c2s, a.s2c, "directional keys are independent");
         let c = derive_traffic(&[9; 32], &[2; 32], &[3; 32], AeadChoice::Aes256Gcm);
-        assert_ne!(a.c2s, c.c2s, "ikm 变化 ⇒ 密钥变化");
-        // chosen 进 HKDF info ⇒ 算法档变化密钥不同
+        assert_ne!(a.c2s, c.c2s, "ikm change ⇒ key change");
+        // chosen goes into the HKDF info ⇒ different algorithm tiers give
+        // different keys
         let d = derive_traffic(&[1; 32], &[2; 32], &[3; 32], AeadChoice::XChaCha20Poly1305);
         assert_ne!(a.c2s, d.c2s);
     }
@@ -2791,9 +2999,9 @@ mod tests {
                 &ident.entry,
                 &ident.entry_sig
             ),
-            "合法凭证通过"
+            "legitimate credential passes"
         );
-        // 篡改条目（换 relay_endpoint）
+        // Tamper the entry (swap relay_endpoint)
         ident.entry.relay_endpoint = "evil.example:9".into();
         assert!(
             !verify_server_entry(
@@ -2802,9 +3010,9 @@ mod tests {
                 &ident.entry,
                 &ident.entry_sig
             ),
-            "条目被篡改 ⇒ 根验签失败"
+            "entry tampered ⇒ root verification fails"
         );
-        // 换根
+        // Swap the root
         let other_root = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
         ident.entry.relay_endpoint = "relay.example:23000".into();
         assert!(
@@ -2814,18 +3022,20 @@ mod tests {
                 &ident.entry,
                 &ident.entry_sig
             ),
-            "另一根 ⇒ 验签失败"
+            "another root ⇒ verification fails"
         );
     }
 
-    /// BoxFuture 接缝的编译期断言（§7-M1：异步接口编译期断言）。
+    /// Compile-time assertion of the BoxFuture seam (§7-M1: async
+    /// interface compile-time assertions).
     #[tokio::test]
     async fn device_directory_is_async_boxfuture() {
         fn take_boxfuture<D: DeviceDirectory>(
             d: &D,
             id: &DeviceId,
         ) -> BoxFuture<'static, LookupVerdict> {
-            // BoxFuture 接缝的编译期断言：lookup 必须能以 'static BoxFuture 返回（§7-M1）
+            // Compile-time assertion of the BoxFuture seam: lookup must
+            // be returnable as a 'static BoxFuture (§7-M1)
             let f: BoxFuture<'static, LookupVerdict> = d.lookup(id);
             f
         }
