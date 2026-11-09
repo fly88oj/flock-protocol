@@ -424,7 +424,7 @@ impl PlatformKeys {
     /// unix 平台专属（0600 权限语义；wasm32 无文件系统）。
     #[cfg(unix)]
     pub fn save_pem(&self, dir: &std::path::Path) -> crate::compat::Result<std::path::PathBuf> {
-        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 
         let priv_path = dir.join("platform_rsa");
         let pem = self.0.to_pkcs8_pem(LineEnding::LF)?;
